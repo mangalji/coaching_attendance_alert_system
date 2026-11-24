@@ -1,0 +1,68 @@
+{% extends 'core/base.html' %}
+{% block content %}
+<a href="javascript:history.back()" class="back">← Back</a>
+<h1>{{ title|title }}</h1>
+<section class="card">
+  <form method="post">
+    {% csrf_token %} {{ form.as_p }} {% if batch_form %}
+    <hr />
+    <h2>Subjects</h2>
+    <p class="muted">
+      Add subjects taught in this batch. Teachers assigned above can mark
+      attendance for subjects without a specific teacher assignment.
+    </p>
+    <div id="subjects">
+      {% for name in subject_names %}
+      <div class="subject-row">
+        <input
+          name="subject_names"
+          maxlength="140"
+          value="{{ name }}"
+          placeholder="Subject name"
+        /><button type="button" class="secondary remove-subject">Remove</button>
+      </div>
+      {% endfor %}
+    </div>
+    <button type="button" class="secondary" id="add-subject">
+      + Add subject
+    </button>
+    <script>
+      const container = document.getElementById("subjects");
+      document.getElementById("add-subject").onclick = () => {
+        const row = document.createElement("div");
+        row.className = "subject-row";
+        row.innerHTML =
+          '<input name="subject_names" maxlength="140" placeholder="Subject name"><button type="button" class="secondary remove-subject">Remove</button>';
+        container.append(row);
+      };
+      container.onclick = (e) => {
+        if (e.target.classList.contains("remove-subject"))
+          e.target.parentElement.remove();
+      };
+    </script>
+    {% endif %}
+{% if invite_form %}
+    <script>
+      const role = document.getElementById("id_role");
+      function setHidden(name, hidden) {
+        const field = document.getElementById("id_" + name);
+        if (field) (field.closest("p") || field.parentElement).hidden = hidden;
+      }
+      function update() {
+        [
+          "roll_number",
+          "guardian_name",
+          "guardian_phone",
+          "guardian_whatsapp_opt_in",
+        ].forEach((n) => setHidden(n, role.value !== "student"));
+        setHidden("batches", role.value === "admin");
+        setHidden("subjects", role.value !== "teacher");
+      }
+      role.addEventListener("change", update);
+      update();
+    </script>
+    {% endif %}
+    <div class="toolbar"><button class="primary">Save changes</button></div>
+  </form>
+</section>
+{% endblock %}

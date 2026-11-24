@@ -1,0 +1,75 @@
+{% extends 'core/base.html' %}
+
+{% block title %}Institute Settings{% endblock %}
+
+{% block content %}
+  <h1>Institute settings</h1>
+  <p class="muted">Brand the portal, configure alerts, and manage WhatsApp delivery.</p>
+
+  <form method="post">
+    {% csrf_token %}
+
+    <section class="card formgrid">
+      <div class="full">
+        <h2>Institute profile</h2>
+      </div>
+      <label>{{ form.name.label }}{{ form.name }}{% for error in form.name.errors %}<span class="errorlist">{{ error }}</span>{% endfor %}</label>
+      <label>{{ form.logo_url.label }}{{ form.logo_url }}{% for error in form.logo_url.errors %}<span class="errorlist">{{ error }}</span>{% endfor %}</label>
+      <label>{{ form.phone.label }}{{ form.phone }}{% for error in form.phone.errors %}<span class="errorlist">{{ error }}</span>{% endfor %}</label>
+      <label>{{ form.email.label }}{{ form.email }}{% for error in form.email.errors %}<span class="errorlist">{{ error }}</span>{% endfor %}</label>
+      <label class="full">{{ form.address.label }}{{ form.address }}{% for error in form.address.errors %}<span class="errorlist">{{ error }}</span>{% endfor %}</label>
+    </section>
+
+    <section class="card formgrid settings-section">
+      <div class="full">
+        <h2>WhatsApp integration</h2>
+        <p class="muted">These credentials are used for automated absence alerts. The access token is encrypted before it is saved.</p>
+      </div>
+
+      <label class="check full">
+        {{ form.whatsapp_enabled }}
+        {{ form.whatsapp_enabled.label }}
+      </label>
+
+      <label class="full">
+        {{ form.whatsapp_access_token.label }}
+        {{ form.whatsapp_access_token }}
+        <small>{{ form.whatsapp_access_token.help_text }}</small>
+        {% for error in form.whatsapp_access_token.errors %}<span class="errorlist">{{ error }}</span>{% endfor %}
+      </label>
+
+      <label>
+        {{ form.whatsapp_phone_number_id.label }}
+        {{ form.whatsapp_phone_number_id }}
+      </label>
+
+      <label>
+        {{ form.whatsapp_template_name.label }}
+        {{ form.whatsapp_template_name }}
+      </label>
+
+      <label>
+        {{ form.whatsapp_template_language.label }}
+        {{ form.whatsapp_template_language }}
+      </label>
+
+      <label>
+        {{ form.whatsapp_graph_version.label }}
+        {{ form.whatsapp_graph_version }}
+      </label>
+
+      <label>
+        {{ form.alert_delay_minutes.label }}
+        {{ form.alert_delay_minutes }}
+        <small>Minutes to wait after attendance is finalized before queuing an alert.</small>
+      </label>
+    </section>
+
+    {% for error in form.non_field_errors %}<p class="notice error">{{ error }}</p>{% endfor %}
+    <div class="toolbar"><button class="primary">Save settings</button></div>
+  </form>
+
+  <p class="notice">
+    Run <code>python manage.py process_alerts</code> through a recurring scheduler to send due alerts.
+  </p>
+{% endblock %}

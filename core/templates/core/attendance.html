@@ -1,0 +1,93 @@
+{% extends 'core/base.html' %}
+{% block title %}Mark Attendance{% endblock %}
+{% block content %}<a href="{% url 'home' %}" class="back">← Dashboard</a>
+<div class="heading">
+  <div>
+    <h1>Mark attendance</h1>
+    <p class="muted">
+      {{ session.batch.name }} · {{ session.subject.name|default:"General" }} ·
+      {{ session.starts_at|date:'d M Y, h:i A' }}
+    </p>
+  </div>
+</div>
+{% if session.attendance_finalized %}
+<p class="notice">
+  Attendance is finalized. Only administrators can make corrections.
+</p>
+{% endif %}
+<form method="post" id="attendanceForm" class="card">
+  {% csrf_token %}
+  <div class="heading">
+    <div>
+      <h2>Student list</h2>
+      <span class="tag">{{ rows|length }} students</span>
+    </div>
+    <div class="quick-actions">
+      <button type="button" class="secondary" data-set-status="present">
+        Mark all present</button
+      ><button type="button" class="secondary" data-set-status="absent">
+        Mark all absent
+      </button>
+    </div>
+  </div>
+  <div class="tablewrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Student</th>
+          <th>Roll</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for student,status in rows %}
+        <tr>
+          <td><strong>{{ student.name }}</strong></td>
+          <td>{{ student.roll_number }}</td>
+          <td>
+            <select class="status" name="status_{{ student.pk }}" required>
+              <option value="">Select status</option>
+              {% for key,label in statuses %}
+              <option
+                value="{{ key }}"
+                {% if status == key %}selected{% endif %}
+              >
+                {{ label }}
+              </option>
+              {% endfor %}
+            </select>
+          </td>
+        </tr>
+        {% empty %}
+        <tr>
+          <td colspan="3" class="empty">No students assigned to this batch.</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="toolbar">
+    <button
+      type="submit"
+      name="finalize"
+      value="no"
+      class="secondary"
+      {% if session.attendance_finalized and role != 'admin' %}disabled{% endif %}
+    >
+      Save draft</button
+    ><button
+      type="submit"
+      name="finalize"
+      value="yes"
+      class="primary"
+      {% if session.attendance_finalized and role != 'admin' %}disabled{% endif %}
+    >
+      Save & finalize
+    </button>
+  </div>
+  <p class="muted">
+    Absent alerts are queued only after finalization, then sent after the
+    configured delay to opted-in guardians.
+  </p>
+</form>
+{% endblock %}

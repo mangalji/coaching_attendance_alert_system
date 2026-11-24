@@ -1,0 +1,108 @@
+{% extends 'core/base.html' %}
+{% block title %}Users{% endblock %}
+{% block content %}
+
+<div class="heading">
+  <div>
+    <h1>Team & accounts</h1>
+    <p class="muted">
+      Invite administrators, teachers, and enrolled students securely.
+    </p>
+  </div>
+
+  <a class="primary action" href="{% url 'invite' %}"> + Add User </a>
+</div>
+
+<section class="card">
+  <form method="get">
+    <label for="role-filter"> Filter by role </label>
+
+    <select id="role-filter" name="role">
+      <option value="all" {% if selected == 'all' %}selected{% endif %}>
+        All users
+      </option>
+
+      <option
+        value="student"
+        {% if selected == 'student' %}selected{% endif %}
+      >
+        Students
+      </option>
+
+      <option
+        value="teacher"
+        {% if selected == 'teacher' %}selected{% endif %}
+      >
+        Teachers
+      </option>
+
+      <option value="admin" {% if selected == 'admin' %}selected{% endif %}>
+        Administrators
+      </option>
+    </select>
+
+    <button type="submit">Filter</button>
+  </form>
+</section>
+
+<section class="card tablewrap">
+  <table>
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>Email</th>
+        <th>Role</th>
+        <th>Status</th>
+        <th>Action</th>
+      </tr>
+    </thead>
+
+    <tbody>
+      {% for a in accounts %}
+
+      <tr>
+        <td>{{ a.first_name }}</td>
+
+        <td>{{ a.email }}</td>
+
+        <td>{{ a.profile.role }}</td>
+
+        <td>{{ a.is_active|yesno:'Active,Invitation pending' }}</td>
+
+        <td>
+          <a class="text-action" href="{% url 'edit_account' a.pk %}">Edit account</a>
+          {% if a.profile.role == 'student' and a.student_record %}
+
+          <a href="{% url 'manage_edit' 'student' a.student_record.pk %}">
+            Edit student
+          </a>
+
+          {% endif %}
+{% if not a.is_active %}
+
+          <form method="post" action="{% url 'resend' a.pk %}">
+            {% csrf_token %}
+
+            <button type="submit">Resend invitation</button>
+          </form>
+
+          {% endif %}
+          <form method="post" action="{% url 'delete_account' a.pk %}" class="inline-form" onsubmit="return confirm('Delete this account?');">
+            {% csrf_token %}
+            <button class="danger-button" type="submit">Delete</button>
+          </form>
+        </td>
+      </tr>
+
+      {% empty %}
+
+      <tr>
+        <td colspan="5">No users found.</td>
+      </tr>
+
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+{% endblock %}

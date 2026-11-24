@@ -1,0 +1,8 @@
+Django>=5.2,<6.0
+psycopg[binary]>=3.2,<4
+PyMySQL>=1.1,<2
+cryptography>=44,<47
+whitenoise>=6.8,<7
+dj-database-url>=2.3,<4
+gunicorn>=23,<25
+requests>=2.32,<3

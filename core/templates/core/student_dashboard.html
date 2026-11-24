@@ -1,0 +1,46 @@
+{% extends 'core/base.html' %}
+{% block content %}
+<h1>Welcome, {{ user.first_name }}</h1>
+{% if student %}
+<p>Roll number: {{ student.roll_number }}</p>
+<div class="stats">
+  {% for c in counts %}
+  <div class="card">
+    <small>{{ c.status|title }}</small><strong>{{ c.total }}</strong>
+  </div>
+  {% endfor %}
+</div>
+<section class="card">
+  <h2>Upcoming classes</h2>
+  {% for s in upcoming %}
+  <p>
+    {{ s.batch }} · {{ s.subject.name|default:"General" }} · {{ s.starts_at }}
+  </p>
+  {% empty %}
+  <p>No upcoming classes.</p>
+  {% endfor %}
+</section>
+<section class="card tablewrap">
+  <h2>My attendance</h2>
+  <table>
+    <tr>
+      <th>Class</th>
+      <th>Date</th>
+      <th>Status</th>
+    </tr>
+    {% for a in records %}
+    <tr>
+      <td>{{ a.session.batch }}</td>
+      <td>{{ a.session.starts_at }}</td>
+      <td>{{ a.status|title }}</td>
+    </tr>
+    {% empty %}
+    <tr>
+      <td colspan="3">No finalized attendance.</td>
+    </tr>
+    {% endfor %}
+  </table>
+</section>
+{% else %}
+<p>Contact your administrator to link your student record.</p>
+{% endif %}{% endblock %}

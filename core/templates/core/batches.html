@@ -1,0 +1,59 @@
+{% extends 'core/base.html' %}
+{% block title %}Batches{% endblock %}
+{% block content %}
+<div class="heading">
+  <div>
+    <h1>Batches</h1>
+    <p class="muted">Subjects, assigned teachers, and enrolled students.</p>
+  </div>
+  {% if role == 'admin' %}<a
+    class="primary action"
+    href="{% url 'manage' 'batch' %}"
+    >+ Add batch</a
+  >{% endif %}
+  {% if role == 'admin' %}
+    <a class="secondary action" href="{% url 'manage' 'subject' %}">+ Add subject</a>
+  {% endif %}
+</div>
+<div class="cards">
+  {% for b in batches %}
+  <article class="card batch-card">
+    <div class="heading">
+      <h2>{{ b.name }}</h2>
+      {% if role == 'admin' %}<a
+        class="text-action"
+        href="{% url 'manage_edit' 'batch' b.pk %}"
+        >Manage</a
+      >{% endif %}
+      {% if role == 'admin' %}
+        <form method="post" action="{% url 'delete_item' 'batch' b.pk %}" class="inline-form" onsubmit="return confirm('Delete this batch?');">
+          {% csrf_token %}
+          <button class="danger-button" type="submit">Delete</button>
+        </form>
+      {% endif %}
+    </div>
+    <p>
+      <small>Subjects</small><br />
+      {% for subject in b.subjects.all %}
+        <span class="subject-chip">{{ subject.name }}</span>
+        {% if role == 'admin' %}
+          <a class="text-action" href="{% url 'manage_edit' 'subject' subject.pk %}">Edit</a>
+          <form method="post" action="{% url 'delete_item' 'subject' subject.pk %}" class="inline-form" onsubmit="return confirm('Delete this subject?');">
+            {% csrf_token %}
+            <button class="danger-button" type="submit">Delete</button>
+          </form>
+        {% endif %}
+      {% empty %}
+        <span class="muted">No subjects added</span>
+      {% endfor %}
+    </p>
+    <p>
+      <small>Assigned teachers</small><br />{% for teacher in b.teachers.all %}{{ teacher.first_name|default:teacher.username }}{% if not forloop.last %}, {% endif %}{% empty %}<span class="muted">Not assigned</span>{% endfor %}
+    </p>
+    <span class="tag">{{ b.student_count }} students</span>
+  </article>
+  {% empty %}
+  <section class="card empty">No batches have been created yet.</section>
+  {% endfor %}
+</div>
+{% endblock %}

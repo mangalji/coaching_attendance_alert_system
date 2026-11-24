@@ -1,0 +1,114 @@
+{% extends 'core/base.html' %}
+{% block title %}Reports{% endblock %}
+{% block content %}
+  <div class="heading">
+    <div>
+      <h1>Attendance reports</h1>
+      <p class="muted">
+        Filter records, review trends, or download the exact result set.
+      </p>
+    </div>
+  </div>
+
+  <section class="card filter-card">
+    <form method="get" class="report-filters">
+      <label>
+        Batch
+        <select name="batch">
+          <option value="">All batches</option>
+          {% for batch in batches %}
+            <option value="{{ batch.pk }}" {% if request.GET.batch == batch.pk|stringformat:'s' %}selected{% endif %}>
+              {{ batch.name }}
+            </option>
+          {% endfor %}
+        </select>
+      </label>
+
+      <label>
+        Status
+        <select name="status">
+          <option value="">All statuses</option>
+          {% for key, label in statuses %}
+            <option value="{{ key }}" {% if request.GET.status == key %}selected{% endif %}>
+              {{ label }}
+            </option>
+          {% endfor %}
+        </select>
+      </label>
+
+      <label>
+        From
+        <input type="date" name="from" value="{{ request.GET.from }}">
+      </label>
+
+      <label>
+        To
+        <input type="date" name="to" value="{{ request.GET.to }}">
+      </label>
+
+      <div class="filter-actions">
+        <button class="secondary">Apply filters</button>
+        <button class="primary" name="format" value="csv">Download CSV</button>
+      </div>
+    </form>
+  </section>
+
+  <div class="stats report-stats">
+    {% for count in counts %}
+      <div class="card">
+        <small>{{ count.status|title }}</small>
+        <strong>{{ count.total }}</strong>
+      </div>
+    {% empty %}
+      <div class="card">
+        <small>Matching records</small>
+        <strong>0</strong>
+      </div>
+    {% endfor %}
+  </div>
+
+  <section class="card">
+    <div class="heading">
+      <h2>Matching attendance records</h2>
+      <span class="tag">Latest 300 shown</span>
+    </div>
+
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Date</th>
+            <th>Student</th>
+            <th>Batch &amp; subject</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for attendance in records %}
+            <tr>
+              <td>{{ attendance.session.starts_at|date:'d M Y, h:i A' }}</td>
+              <td>
+                {{ attendance.student.name }}
+                <br>
+                <small>{{ attendance.student.roll_number }}</small>
+              </td>
+              <td>
+                {{ attendance.session.batch.name }} ·
+                {{ attendance.session.subject.name|default:"General" }}
+              </td>
+              <td>
+                <span class="tag {% if attendance.status == 'present' %}green{% elif attendance.status == 'absent' %}danger{% else %}amber{% endif %}">
+                  {{ attendance.get_status_display }}
+                </span>
+              </td>
+            </tr>
+          {% empty %}
+            <tr>
+              <td colspan="4" class="empty">No records match these filters.</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

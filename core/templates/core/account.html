@@ -1,0 +1,43 @@
+{% load static %}<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="referrer" content="same-origin" />
+    <link rel="stylesheet" href="{% static 'core/app.css' %}" />
+    <title>{{ title }}</title>
+  </head>
+  <body class="loginbg">
+    <main class="card" style="width: min(92vw, 850px); padding: 32px">
+      <p class="muted">{{ institute.name|default:'Coaching Portal' }}</p>
+      <h1>{{ title }}</h1>
+      {% if error %}
+      <p class="notice error">{{ error }}</p>
+      {% endif %}
+{% if landing %}
+      <div class="cards">
+        <a class="card action" href="{% url 'portal_login' 'admin' %}"
+          ><h2>Admin Login</h2>
+          Manage your institute</a
+        ><a class="card action" href="{% url 'portal_login' 'teacher' %}"
+          ><h2>Teacher Login</h2>
+          Classes and attendance</a
+        ><a class="card action" href="{% url 'portal_login' 'student' %}"
+          ><h2>Student Login</h2>
+          Your classes and progress</a
+        >
+      </div>
+      {% endif %}
+{% if form %}
+      <form method="post">
+        {% csrf_token %}{{ form.as_p }}<button class="primary wide">
+          Continue
+        </button>
+      </form>
+      {% endif %}
+{% if not landing %}
+      <p><a href="{% url 'home' %}">Back to portal selection</a></p>
+      {% endif %}
+    </main>
+  </body>
+</html>

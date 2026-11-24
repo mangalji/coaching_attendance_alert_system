@@ -1,0 +1,58 @@
+{% extends 'core/base.html' %}
+{% block title %}Follow-ups{% endblock %}
+{% block content %}
+<h1>Parent follow-ups</h1>
+<p class="muted">
+  Track absences, WhatsApp delivery, and parent contact attempts.
+</p>
+<div class="cards">
+  {% for f in followups %}
+  <article class="card">
+    <div class="heading">
+      <h2>{{ f.attendance.student.name }}</h2>
+      <span
+        class="tag {% if f.status == 'resolved' %}green{% elif f.status == 'pending' %}amber{% endif %}"
+        >{{ f.get_status_display }}</span
+      >
+    </div>
+    <p class="muted">
+      {{ f.attendance.session.batch.name }} · {{ f.attendance.session.starts_at|date:'d M Y, h:i A' }}
+    </p>
+    <p>
+      <small>WhatsApp alert:</small> {% if f.attendance.guardianalert %}<span
+        class="tag {% if f.attendance.guardianalert.status == 'sent' %}green{% elif f.attendance.guardianalert.status == 'failed' %}danger{% else %}amber{% endif %}"
+        >{{ f.attendance.guardianalert.get_status_display }}</span
+      >{% else %}<span class="muted">Not queued yet</span>{% endif %}
+    </p>
+    <form method="post" action="{% url 'update_followup' f.pk %}">
+      {% csrf_token %}<label
+        >Contact result<select name="status">
+          <option
+            value="pending"
+            {% if f.status == 'pending' %}selected{% endif %}
+          >
+            Pending
+          </option>
+          <option
+            value="contacted"
+            {% if f.status == 'contacted' %}selected{% endif %}
+          >
+            Contacted
+          </option>
+          <option
+            value="resolved"
+            {% if f.status == 'resolved' %}selected{% endif %}
+          >
+            Resolved
+          </option>
+        </select></label
+      ><label
+        >Notes<textarea name="reason" rows="2">{{ f.reason }}</textarea></label
+      ><button class="primary">Update follow-up</button>
+    </form>
+  </article>
+  {% empty %}
+  <section class="card empty">No absences currently need follow-up.</section>
+  {% endfor %}
+</div>
+{% endblock %}
