@@ -11,6 +11,8 @@
     <main class="card" style="width: min(92vw, 850px); padding: 32px">
       <p class="muted">{{ institute.name|default:'Coaching Portal' }}</p>
       <h1>{{ title }}</h1>
+      {% if messages %}{% for message in messages %}<p class="notice {{ message.tags }}">{{ message }}</p>{% endfor %}{% endif %}
+      {% if notice %}<p class="notice success">{{ notice }}</p>{% endif %}
       {% if error %}
       <p class="notice error">{{ error }}</p>
       {% endif %}

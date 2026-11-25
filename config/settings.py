@@ -1,4 +1,5 @@
 import os
+import sys
 from pathlib import Path
 from .database import build_database_config
 
@@ -14,6 +15,8 @@ SECRET_KEY = os.getenv(
     "DJANGO_SECRET_KEY", "dev-only-insecure-key-change-before-deploy"
 )
 DEBUG = os.getenv("DJANGO_DEBUG", "False").lower() == "true"
+if not DEBUG and SECRET_KEY.startswith("dev-only-insecure-key"):
+    raise RuntimeError("Set DJANGO_SECRET_KEY when DJANGO_DEBUG is False.")
 ALLOWED_HOSTS = [
     x.strip()
     for x in os.getenv("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
@@ -73,10 +76,15 @@ USE_I18N = True
 USE_TZ = True
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
+# The hashed manifest storage needs `collectstatic`; use plain storage in dev/tests.
+_plain_static = DEBUG or "test" in sys.argv
 STORAGES = {
+    "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
     "staticfiles": {
-        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"
-    }
+        "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"
+        if _plain_static
+        else "whitenoise.storage.CompressedManifestStaticFilesStorage"
+    },
 }
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 LOGIN_URL = "/login/"
@@ -107,7 +115,7 @@ EMAIL_HOST = os.getenv("EMAIL_HOST", "smtp.gmail.com")
 EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
 EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "")
 EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "")
-EMAIL_USE_TLS = True
+EMAIL_USE_TLS = os.getenv("EMAIL_USE_TLS", "True").lower() == "true"
 EMAIL_TIMEOUT = 15
 DEFAULT_FROM_EMAIL = (
     os.getenv("DEFAULT_FROM_EMAIL") or EMAIL_HOST_USER or "portal@example.invalid"
@@ -115,3 +123,16 @@ DEFAULT_FROM_EMAIL = (
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8000")
 SESSION_COOKIE_AGE = 28800
 SESSION_EXPIRE_AT_BROWSER_CLOSE = True
+
+if os.getenv("SECURE_PROXY_SSL_HEADER", "").lower() == "true":
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+if not DEBUG and os.getenv("FORCE_HTTPS", "False").lower() == "true":
+    SECURE_SSL_REDIRECT = True
+    SECURE_HSTS_SECONDS = 31536000
+
+# Country code prepended to 10-digit guardian numbers (E.164 for WhatsApp).
+DEFAULT_COUNTRY_CODE = os.getenv("DEFAULT_COUNTRY_CODE", "91")
+# Meta webhook (delivery receipts)
+WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
+WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "")
+WHITENOISE_USE_FINDERS = DEBUG or "test" in sys.argv

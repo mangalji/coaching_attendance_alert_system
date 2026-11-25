@@ -1,9 +1,13 @@
 {% extends 'core/base.html' %}
+{% block title %}My attendance{% endblock %}
 {% block content %}
 <h1>Welcome, {{ user.first_name }}</h1>
 {% if student %}
 <p>Roll number: {{ student.roll_number }}</p>
 <div class="stats">
+  <div class="card">
+    <small>Attendance</small><strong>{% if summary.percentage is None %}—{% else %}{{ summary.percentage }}%{% endif %}</strong>
+  </div>
   {% for c in counts %}
   <div class="card">
     <small>{{ c.status|title }}</small><strong>{{ c.total }}</strong>
@@ -14,7 +18,7 @@
   <h2>Upcoming classes</h2>
   {% for s in upcoming %}
   <p>
-    {{ s.batch }} · {{ s.subject.name|default:"General" }} · {{ s.starts_at }}
+    {{ s.batch }} · {{ s.subject.name|default:"General" }} · {{ s.starts_at|date:'D, d M Y, h:i A' }}
   </p>
   {% empty %}
   <p>No upcoming classes.</p>
@@ -25,18 +29,20 @@
   <table>
     <tr>
       <th>Class</th>
+      <th>Subject</th>
       <th>Date</th>
       <th>Status</th>
     </tr>
     {% for a in records %}
     <tr>
       <td>{{ a.session.batch }}</td>
-      <td>{{ a.session.starts_at }}</td>
+      <td>{{ a.session.subject.name|default:"General" }}</td>
+      <td>{{ a.session.starts_at|date:'d M Y, h:i A' }}</td>
       <td>{{ a.status|title }}</td>
     </tr>
     {% empty %}
     <tr>
-      <td colspan="3">No finalized attendance.</td>
+      <td colspan="4">No finalized attendance.</td>
     </tr>
     {% endfor %}
   </table>

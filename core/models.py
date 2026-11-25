@@ -248,6 +248,10 @@ class GuardianAlert(models.Model):
     last_error = models.TextField(blank=True)
     sent_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    next_attempt_at = models.DateTimeField(null=True, blank=True)
+    claimed_at = models.DateTimeField(null=True, blank=True)
+    # Latest Meta delivery receipt: sent / delivered / read / failed
+    delivery_status = models.CharField(max_length=12, blank=True)
 
     class Meta:
         indexes = [

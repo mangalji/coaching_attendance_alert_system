@@ -1,0 +1,12 @@
+# One stack per institute. Use PostgreSQL/MySQL (DATABASE_URL) in .env so web and alerts share data.
+# Copy .env.example to .env, edit it, then `docker compose up -d`.
+services:
+  web:
+    build: .
+    env_file: .env
+    ports: ["8000:8000"]
+  alerts:
+    build: .
+    env_file: .env
+    command: python manage.py process_alerts --loop --interval 60
+    depends_on: [web]

@@ -49,6 +49,7 @@
       <div class="filter-actions">
         <button class="secondary">Apply filters</button>
         <button class="primary" name="format" value="csv">Download CSV</button>
+        <button class="secondary" name="format" value="summary_csv">Student summary CSV</button>
       </div>
     </form>
   </section>
@@ -66,6 +67,32 @@
       </div>
     {% endfor %}
   </div>
+
+  <section class="card">
+    <div class="heading">
+      <h2>Attendance by student</h2>
+      <span class="tag">Overall {% if summary.percentage is None %}—{% else %}{{ summary.percentage }}%{% endif %}</span>
+    </div>
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr><th>Student</th><th>Present</th><th>Late</th><th>Absent</th><th>Excused</th><th>Attendance</th></tr>
+        </thead>
+        <tbody>
+          {% for r in student_rows %}
+          <tr>
+            <td>{{ r.student__name }}<br><small>{{ r.student__roll_number }}</small></td>
+            <td>{{ r.present }}</td><td>{{ r.late }}</td><td>{{ r.absent }}</td><td>{{ r.excused }}</td>
+            <td><span class="tag {% if r.percentage is not None and r.percentage < 75 %}danger{% elif r.percentage is not None %}green{% endif %}">{% if r.percentage is None %}—{% else %}{{ r.percentage }}%{% endif %}</span></td>
+          </tr>
+          {% empty %}
+          <tr><td colspan="6" class="empty">No records match these filters.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p class="muted"><small>Attendance % counts present and late; excused classes are excluded. Below 75% is highlighted.</small></p>
+  </section>
 
   <section class="card">
     <div class="heading">

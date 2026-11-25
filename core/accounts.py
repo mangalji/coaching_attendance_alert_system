@@ -4,15 +4,19 @@ from datetime import timedelta
 
 from django import forms
 from django.conf import settings
+from django.contrib import messages
 from django.contrib.auth import authenticate, get_user_model, login
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import SetPasswordForm
 from django.contrib.auth.hashers import check_password, make_password
+from django.contrib.auth.tokens import default_token_generator
 from django.core.mail import send_mail
 from django.db import transaction
 from django.http import HttpResponseForbidden
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
+from django.utils.encoding import force_bytes
+from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from django.utils import timezone
 from django.views.decorators.cache import never_cache
 from django.views.decorators.http import require_http_methods
@@ -28,6 +32,7 @@ from .models import (
     Subject,
 )
 from .forms import UserAccountForm
+from .services import normalize_phone
 
 User = get_user_model()
 ROLES = ("admin", "teacher", "student")
@@ -137,9 +142,6 @@ def sign_in(request, portal):
                     settings.DEFAULT_FROM_EMAIL,
                     [user.email],
                 )
-                print(
-                    f"Your sign-in code: Your code is {code}. Expires in 5 minutes. Do not share it, {settings.DEFAULT_FROM_EMAIL},{user.email} "
-                )
             except Exception:
                 return page(
                     request,
@@ -212,9 +214,14 @@ class InviteForm(forms.Form):
 
     subjects = forms.ModelMultipleChoiceField(queryset=Subject.objects.filter(batch__active=True).select_related("batch"), required=False, widget=forms.CheckboxSelectMultiple)
 
+    def clean_guardian_phone(self):
+        return normalize_phone(self.cleaned_data.get("guardian_phone"))
+
     def clean(self):
         d = super().clean()
         email = d.get("email", "").lower()
+        if d.get("role") == "student" and d.get("guardian_whatsapp_opt_in") and not d.get("guardian_phone"):
+            self.add_error("guardian_phone", "A phone number is required when WhatsApp alerts are enabled.")
         if User.objects.filter(email__iexact=email).exists():
             self.add_error("email", "Email already registered.")
         if d.get("role") in ("teacher", "student") and not d.get("batches"):
@@ -424,3 +431,62 @@ def accept(request, token):
             return redirect("home")
         return page(request, "Create your password", form)
 
+
+
+class ForgotPasswordForm(forms.Form):
+    email = forms.EmailField()
+
+
+@never_cache
+@require_http_methods(["GET", "POST"])
+def forgot_password(request):
+    """Email a one-time password-reset link. The response never reveals whether the email exists."""
+    if request.user.is_authenticated:
+        return redirect("dashboard")
+    form = ForgotPasswordForm(request.POST or None)
+    if request.method == "POST" and form.is_valid():
+        email = form.cleaned_data["email"].lower()
+        if limited("ip:" + request.META.get("REMOTE_ADDR", ""), 30) or limited("reset:" + email, 5):
+            return page(request, "Reset password", form, "Too many attempts. Try later.")
+        users = list(User.objects.filter(email__iexact=email, is_active=True)[:2])
+        if len(users) == 1 and role_of(users[0]):
+            user = users[0]
+            uid = urlsafe_base64_encode(force_bytes(user.pk))
+            url = settings.PUBLIC_BASE_URL.rstrip("/") + reverse(
+                "reset_password", args=[uid, default_token_generator.make_token(user)]
+            )
+            try:
+                send_mail(
+                    "Reset your portal password",
+                    f"Use this link to choose a new password. It expires in 3 days and works once: {url}\n\n"
+                    "If you did not ask for this, ignore this email.",
+                    settings.DEFAULT_FROM_EMAIL,
+                    [user.email],
+                )
+            except Exception:
+                return page(request, "Reset password", form, "Email delivery failed. Contact administrator.")
+        return page(
+            request,
+            "Check your email",
+            error="",
+            notice="If an active account uses that address, a reset link is on its way.",
+        )
+    return page(request, "Reset password", form)
+
+
+@never_cache
+@require_http_methods(["GET", "POST"])
+def reset_password(request, uidb64, token):
+    try:
+        user = User.objects.get(pk=urlsafe_base64_decode(uidb64).decode(), is_active=True)
+    except (User.DoesNotExist, ValueError, TypeError, OverflowError):
+        user = None
+    if not user or not role_of(user) or not default_token_generator.check_token(user, token):
+        return page(request, "Link unavailable", error="This reset link is invalid or has expired.")
+    form = SetPasswordForm(user, request.POST or None)
+    if request.method == "POST" and form.is_valid():
+        form.save()
+        LoginChallenge.objects.filter(user=user).delete()
+        messages.success(request, "Password updated. Sign in with your new password.")
+        return redirect("home")
+    return page(request, "Choose a new password", form)

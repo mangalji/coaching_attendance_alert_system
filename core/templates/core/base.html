@@ -47,12 +47,9 @@
           <a href="{% url 'batches' %}"> ▦ Batches </a>
 
           {% endif %}
-{% if role == 'admin' %}
+{% if role != 'student' %}
 
           <a href="{% url 'followups' %}"> ☏ Follow-ups </a>
-
-          {% endif %}
-{% if role != 'student' %}
 
           <a href="{% url 'reports' %}"> ▤ Reports </a>
 

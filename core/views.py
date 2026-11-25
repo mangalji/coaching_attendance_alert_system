@@ -16,8 +16,22 @@ from .models import (
     Session,
     Attendance,
     FollowUp,
+    GuardianAlert,
 )
-from .services import save_attendance, save_batch_with_subjects
+import hashlib
+import hmac
+import json
+
+from django.conf import settings
+from django.views.decorators.csrf import csrf_exempt
+from .services import (
+    apply_delivery_receipt,
+    attendance_summary,
+    retry_alert,
+    save_attendance,
+    save_batch_with_subjects,
+    student_summaries,
+)
 
 from .accounts import is_admin, role_of
 from django.db import transaction
@@ -45,14 +59,14 @@ def home(request):
         records = (
             Attendance.objects.filter(
                 student=student, session__attendance_finalized=True
-            ).select_related("session__batch")
+            ).select_related("session__batch", "session__subject")
             if student
             else Attendance.objects.none()
         )
         upcoming = (
             Session.objects.filter(
                 batch__students=student, starts_at__gte=timezone.now()
-            ).order_by("starts_at")
+            ).select_related("batch", "subject").order_by("starts_at")
             if student
             else Session.objects.none()
         )
@@ -64,6 +78,7 @@ def home(request):
                 "student": student,
                 "records": records[:100],
                 "counts": records.values("status").annotate(total=Count("id")),
+                "summary": attendance_summary(records) if student else None,
                 "upcoming": upcoming[:20],
             },
         )
@@ -167,24 +182,39 @@ def attendance(request, pk):
     )
 
 
+def _followup_scope(request):
+    qs = FollowUp.objects.select_related(
+        "attendance__student", "attendance__session__batch", "attendance__session__subject",
+        "attendance__guardianalert", "assigned_to",
+    )
+    if role(request) == "teacher" and not request.user.is_superuser:
+        qs = qs.filter(teacher_session_filter(request.user, "attendance__session__")).distinct()
+    return qs
+
+
 @login_required
 def followups(request):
-    if not is_admin(request.user):
+    if not allowed(request, "admin", "teacher"):
         return HttpResponseForbidden()
-    qs = FollowUp.objects.select_related(
-        "attendance__student", "attendance__session__batch", "attendance__guardianalert"
-    ).order_by("-updated_at")
+    qs = _followup_scope(request).order_by("-updated_at")
+    show = request.GET.get("show", "open")
+    if show == "open":
+        qs = qs.exclude(status="resolved")
+    elif show in dict(FollowUp.STATUS):
+        qs = qs.filter(status=show)
     return render(
-        request, "core/followups.html", {**common(request), "followups": qs[:200]}
+        request,
+        "core/followups.html",
+        {**common(request), "followups": qs[:200], "show": show},
     )
 
 
 @login_required
 @require_POST
 def update_followup(request, pk):
-    if not is_admin(request.user):
+    if not allowed(request, "admin", "teacher"):
         return HttpResponseForbidden()
-    item = get_object_or_404(FollowUp, pk=pk)
+    item = get_object_or_404(_followup_scope(request), pk=pk)
     status = request.POST.get("status")
     if status not in dict(FollowUp.STATUS):
         return JsonResponse({"error": "Invalid status"}, status=400)
@@ -193,6 +223,30 @@ def update_followup(request, pk):
     item.assigned_to = request.user
     item.save()
     messages.success(request, "Follow-up updated.")
+    return redirect(request.POST.get("next") or "followups")
+
+
+@login_required
+@require_POST
+def retry_followup_alert(request, pk):
+    """Re-queue a failed or cancelled WhatsApp alert for another round of attempts."""
+    if not allowed(request, "admin", "teacher"):
+        return HttpResponseForbidden()
+    item = get_object_or_404(_followup_scope(request), pk=pk)
+    alert = getattr(item.attendance, "guardianalert", None)
+    student = item.attendance.student
+    if not alert:
+        if not (student.guardian_whatsapp_opt_in and student.guardian_phone):
+            messages.error(request, "Add a guardian phone number and WhatsApp consent on the student record first.")
+        elif not item.attendance.session.attendance_finalized:
+            messages.error(request, "Finalize this session's attendance to queue the alert.")
+        else:
+            GuardianAlert.objects.get_or_create(attendance=item.attendance)
+            messages.success(request, "Alert queued; it will be sent on the next scheduler run.")
+    elif alert.status in ("failed", "cancelled") and retry_alert(alert):
+        messages.success(request, "Alert re-queued; it will be sent on the next scheduler run.")
+    else:
+        messages.error(request, "This alert cannot be retried.")
     return redirect("followups")
 
 
@@ -232,11 +286,23 @@ def reports(request):
         response["Content-Disposition"] = 'attachment; filename="attendance-report.csv"'
         writer = csv.writer(response)
         writer.writerow(["Date", "Student", "Roll number", "Batch", "Subject", "Status"])
-        for item in qs:
+        for item in qs.iterator(chunk_size=500):
             writer.writerow([
                 timezone.localtime(item.session.starts_at).strftime("%Y-%m-%d %H:%M"),
                 item.student.name, item.student.roll_number, item.session.batch.name,
                 item.session.subject.name if item.session.subject_id else "", item.status,
+            ])
+        return response
+    if request.GET.get("format") == "summary_csv":
+        response = HttpResponse(content_type="text/csv")
+        response["Content-Disposition"] = 'attachment; filename="student-attendance-summary.csv"'
+        writer = csv.writer(response)
+        writer.writerow(["Roll number", "Student", "Present", "Late", "Absent", "Excused", "Total", "Attendance %"])
+        for r in student_summaries(qs):
+            writer.writerow([
+                r["student__roll_number"], r["student__name"], r["present"], r["late"],
+                r["absent"], r["excused"], r["total"],
+                "" if r["percentage"] is None else r["percentage"],
             ])
         return response
     return render(
@@ -245,7 +311,9 @@ def reports(request):
         {
             **common(request),
             "records": qs[:300],
-            "counts": qs.values("status").annotate(total=Count("id")),
+            "counts": qs.order_by().values("status").annotate(total=Count("id")),
+            "summary": attendance_summary(qs.order_by()),
+            "student_rows": student_summaries(qs),
             "batches": visible_batches,
             "statuses": Attendance.STATUS,
         },
@@ -316,6 +384,10 @@ def manage(request, kind, pk=None):
                 form.add_error(None, str(exc))
             else:
                 return redirect("batches")
+        elif kind == "session":
+            created = form.save_with_repeats()
+            messages.success(request, f"{created} class{'es' if created != 1 else ''} scheduled.")
+            return redirect("dashboard")
         else:
             form.save()
             return redirect(
@@ -362,3 +434,35 @@ def delete_item(request, kind, pk):
     else:
         messages.success(request, f"{kind.title()} deleted.")
     return redirect(destination)
+
+
+@csrf_exempt
+def whatsapp_webhook(request):
+    """Meta webhook: GET verifies the subscription; POST delivers status receipts."""
+    token = settings.WHATSAPP_VERIFY_TOKEN
+    if request.method == "GET":
+        if (
+            token
+            and request.GET.get("hub.mode") == "subscribe"
+            and hmac.compare_digest(request.GET.get("hub.verify_token", ""), token)
+        ):
+            return HttpResponse(request.GET.get("hub.challenge", ""), content_type="text/plain")
+        return HttpResponseForbidden()
+    if request.method != "POST":
+        return HttpResponse(status=405)
+    secret = settings.WHATSAPP_APP_SECRET
+    if not secret:
+        return HttpResponseForbidden()  # refuse unsigned receipts
+    expected = "sha256=" + hmac.new(secret.encode(), request.body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(request.headers.get("X-Hub-Signature-256", ""), expected):
+        return HttpResponseForbidden()
+    try:
+        payload = json.loads(request.body)
+    except ValueError:
+        return HttpResponse(status=400)
+    for entry in payload.get("entry", []):
+        for change in entry.get("changes", []):
+            for st in change.get("value", {}).get("statuses", []):
+                errors = st.get("errors") or [{}]
+                apply_delivery_receipt(st.get("id", ""), st.get("status", ""), errors[0].get("title", ""))
+    return HttpResponse("ok")
