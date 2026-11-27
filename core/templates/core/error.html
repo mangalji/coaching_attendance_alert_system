@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ title }}</title>
+  <style>
+    body{font-family:system-ui,sans-serif;background:#f7f9ff;color:#1b2440;display:grid;place-items:center;min-height:100vh;margin:0}
+    main{background:#fff;border-radius:16px;padding:2rem 2.5rem;max-width:30rem;box-shadow:0 6px 24px rgba(34,86,217,.12);text-align:center}
+    h1{margin:.2rem 0 .6rem}.code{color:#2256d9;font-weight:700;font-size:3rem}
+    a{display:inline-block;margin-top:1rem;background:#2256d9;color:#fff;padding:.6rem 1.2rem;border-radius:10px;text-decoration:none}
+  </style>
+</head>
+<body>
+  <main>
+    <div class="code">{{ status }}</div>
+    <h1>{{ title }}</h1>
+    <p>{{ message }}</p>
+    <a href="/">Back to home</a>
+  </main>
+</body>
+</html>

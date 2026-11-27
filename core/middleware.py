@@ -17,3 +17,25 @@ class VerifiedSessionMiddleware:
         ):
             return redirect("home")
         return self.get_response(request)
+
+
+class SecurityHeadersMiddleware:
+    """Adds CSP and Permissions-Policy. Inline scripts are used by a few pages, hence 'unsafe-inline'."""
+
+    CSP = (
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' https: data:; frame-ancestors 'none'; base-uri 'self'; "
+        "form-action 'self'; object-src 'none'"
+    )
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        response = self.get_response(request)
+        response.headers.setdefault("Content-Security-Policy", self.CSP)
+        response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()")
+        user = getattr(request, "user", None)  # absent when an earlier middleware rejected the request
+        if user is not None and user.is_authenticated:
+            response.headers.setdefault("Cache-Control", "private, no-store")
+        return response

@@ -19,6 +19,12 @@ class Institute(models.Model):
     whatsapp_template_language = models.CharField(max_length=20, blank=True)
     whatsapp_graph_version = models.CharField(max_length=20, blank=True)
 
+    def save(self, *args, **kwargs):
+        # Single-tenant-per-deployment singleton: every save lands on the same row, so
+        # concurrent first-time settings saves can never create two Institute records.
+        self.pk = 1
+        super().save(*args, **kwargs)
+
     def set_whatsapp_access_token(self, value):
         from .crypto import encrypt_secret
 

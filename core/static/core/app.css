@@ -417,3 +417,8 @@ textarea:focus {
   color: #fff;
   background: #b42331;
 }
+
+.pager { display: flex; align-items: center; gap: 1rem; justify-content: center; margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--border, #e4e8f5); }
+.pager a { font-weight: 600; }
+.search-form { display: flex; gap: .5rem; align-items: center; margin: 1rem 0; }
+.search-form input[type="search"] { flex: 1; min-width: 0; }

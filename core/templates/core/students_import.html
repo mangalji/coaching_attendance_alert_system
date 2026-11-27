@@ -1,0 +1,58 @@
+{% extends 'core/base.html' %}
+{% block title %}Import students{% endblock %}
+{% block content %}
+<div class="heading">
+  <div>
+    <h1>Bulk import students</h1>
+    <p class="muted">Add many students at once from a CSV file. Good for enrolling a large batch in one go.</p>
+  </div>
+  <a class="action" href="{% url 'students' %}">&laquo; Back to Students</a>
+</div>
+
+<section class="card">
+  <h2>1. Prepare your file</h2>
+  <p>
+    Columns required: <code>name</code>, <code>roll_number</code>, <code>batch</code> (must match an existing
+    batch's name exactly). Optional: <code>guardian_name</code>, <code>guardian_phone</code>,
+    <code>guardian_whatsapp_opt_in</code> (yes/no).
+  </p>
+  <p class="muted"><small>
+    This creates student and guardian-contact records only. It does not create portal logins — invite
+    individual students afterwards from the Students page if they need one.
+  </small></p>
+  <a class="secondary action" href="{% url 'students_import_template' %}">Download a sample CSV</a>
+</section>
+
+<section class="card">
+  <h2>2. Upload</h2>
+  <form method="post" enctype="multipart/form-data">
+    {% csrf_token %}
+    <label for="csv_file">CSV file</label>
+    <input type="file" id="csv_file" name="csv_file" accept=".csv,text/csv" required />
+    <button class="primary" type="submit">Import</button>
+  </form>
+</section>
+
+{% if result %}
+<section class="card">
+  <h2>Result</h2>
+  <p><strong>{{ result.created }}</strong> student{{ result.created|pluralize }} imported successfully.</p>
+  {% if result.error_count %}
+  <p class="tag amber">{{ result.error_count }} row{{ result.error_count|pluralize }} skipped</p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Row</th><th>Reason</th></tr></thead>
+      <tbody>
+        {% for row_num, reason in result.errors %}
+        <tr><td>{{ row_num }}</td><td>{{ reason }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if result.error_count > result.errors|length %}
+  <p class="muted"><small>Showing the first {{ result.errors|length }} of {{ result.error_count }} skipped rows. Fix these, re-export, and re-upload just the corrected rows.</small></p>
+  {% endif %}
+  {% endif %}
+</section>
+{% endif %}
+{% endblock %}

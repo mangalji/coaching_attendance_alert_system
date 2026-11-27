@@ -1,9 +1,13 @@
 """Shared, validated forms for institute operations."""
 
+import re
+
 from django import forms
 from django.contrib.auth import get_user_model
 
 from datetime import timedelta
+
+from django.utils import timezone
 
 from .models import Batch, Institute, Profile, Session, Student, Subject
 from .services import normalize_phone
@@ -23,6 +27,18 @@ class InstituteSettingsForm(forms.ModelForm):
             "alert_delay_minutes", "whatsapp_enabled", "whatsapp_phone_number_id",
             "whatsapp_template_name", "whatsapp_template_language", "whatsapp_graph_version",
         ]
+
+    def clean_whatsapp_graph_version(self):
+        v = self.cleaned_data.get("whatsapp_graph_version", "").strip()
+        if v and not re.fullmatch(r"v\d{1,2}\.\d{1,2}", v):
+            raise forms.ValidationError("Use a version like v20.0.")
+        return v
+
+    def clean_whatsapp_phone_number_id(self):
+        v = self.cleaned_data.get("whatsapp_phone_number_id", "").strip()
+        if v and not v.isascii() or v and not v.isdigit():
+            raise forms.ValidationError("The phone number ID contains digits only.")
+        return v
 
     def save(self, commit=True):
         institute = super().save(commit=False)
@@ -84,27 +100,35 @@ class SessionForm(forms.ModelForm):
         return cleaned
 
     def save_with_repeats(self):
-        """Save the class and any weekly repeats; returns the number of sessions created."""
+        """Save the class and any weekly repeats.
+
+        Returns (created, skipped): skipped counts weeks where the batch already had a
+        class at that exact time (that existing session is left untouched).
+        Repeats are computed on local wall-clock time so a class at "6 PM every week"
+        stays at 6 PM across a daylight-saving change, instead of drifting an hour.
+        """
         first = self.save()
         until = self.cleaned_data.get("repeat_weekly_until")
-        created = 1
+        created, skipped = 1, 0
         if until:
+            tzinfo = timezone.get_current_timezone()
+            local_start = timezone.localtime(first.starts_at).replace(tzinfo=None)
+            local_end = timezone.localtime(first.ends_at).replace(tzinfo=None)
             step = 1
             while True:
-                starts = first.starts_at + timedelta(weeks=step)
-                if starts.date() > until:
+                next_start = local_start + timedelta(weeks=step)
+                if next_start.date() > until:
                     break
+                starts = timezone.make_aware(next_start, tzinfo)
+                ends = timezone.make_aware(local_end + timedelta(weeks=step), tzinfo)
                 _, made = Session.objects.get_or_create(
-                    batch=first.batch,
-                    starts_at=starts,
-                    defaults={
-                        "subject": first.subject,
-                        "ends_at": first.ends_at + timedelta(weeks=step),
-                    },
+                    batch=first.batch, starts_at=starts,
+                    defaults={"subject": first.subject, "ends_at": ends},
                 )
                 created += int(made)
+                skipped += int(not made)
                 step += 1
-        return created
+        return created, skipped
 
 
 class StudentForm(forms.ModelForm):
@@ -138,6 +162,15 @@ class SubjectForm(forms.ModelForm):
         self.fields["teachers"].queryset = get_user_model().objects.filter(
             profile__role="teacher", is_active=True
         ).order_by("first_name", "email")
+
+    def clean(self):
+        cleaned = super().clean()
+        batch, name = cleaned.get("batch"), cleaned.get("name", "").strip()
+        if batch and name:
+            clash = batch.subjects.exclude(pk=self.instance.pk).filter(name__iexact=name)
+            if clash.exists():
+                self.add_error("name", f'"{clash.first().name}" already exists for this batch.')
+        return cleaned
 
 
 class UserAccountForm(forms.ModelForm):

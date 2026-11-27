@@ -1,13 +1,16 @@
 from django.contrib.auth.decorators import login_required
 from django.contrib import messages
-from django.db.models import Count
+from django.db.models import Count, Q
 from django.db.models.deletion import ProtectedError
 import csv
 
-from django.http import HttpResponse, HttpResponseForbidden, JsonResponse
+from django.http import HttpResponse, HttpResponseForbidden, JsonResponse, StreamingHttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
-from django.views.decorators.http import require_POST
+from django.core.paginator import Paginator
+from django.utils.dateparse import parse_date
+from django.utils.http import url_has_allowed_host_and_scheme
+from django.views.decorators.http import require_POST, require_http_methods
 from .models import (
     Institute,
     Batch,
@@ -25,13 +28,17 @@ import json
 from django.conf import settings
 from django.views.decorators.csrf import csrf_exempt
 from .services import (
+    IMPORT_TEMPLATE_CSV,
     apply_delivery_receipt,
+    bulk_import_students,
     attendance_summary,
     retry_alert,
     save_attendance,
     save_batch_with_subjects,
     student_summaries,
 )
+import io
+
 
 from .accounts import is_admin, role_of
 from django.db import transaction
@@ -84,7 +91,7 @@ def home(request):
         )
     if r not in ("admin", "teacher"):
         return HttpResponseForbidden()
-    sessions = Session.objects.select_related("batch").order_by("-starts_at")
+    sessions = Session.objects.select_related("batch", "subject").order_by("-starts_at")
     if r == "teacher" and not request.user.is_superuser:
         sessions = sessions.filter(teacher_session_filter(request.user)).distinct()
     roster = Student.objects.filter(active=True)
@@ -119,7 +126,14 @@ def students(request):
     if role(request) == "teacher":
         qs = qs.filter(batches__teachers=request.user).distinct()
 
-    return render(request, "core/students.html", {**common(request), "students": qs})
+    search = request.GET.get("q", "").strip()[:140]
+    if search:
+        qs = qs.filter(Q(name__icontains=search) | Q(roll_number__icontains=search))
+
+    page_obj = Paginator(qs, settings.LIST_PAGE_SIZE).get_page(request.GET.get("page"))
+    return render(
+        request, "core/students.html", {**common(request), "students": page_obj, "page_obj": page_obj, "q": search}
+    )
 
 
 @login_required
@@ -223,7 +237,10 @@ def update_followup(request, pk):
     item.assigned_to = request.user
     item.save()
     messages.success(request, "Follow-up updated.")
-    return redirect(request.POST.get("next") or "followups")
+    target = request.POST.get("next", "")
+    if not url_has_allowed_host_and_scheme(target, {request.get_host()}, request.is_secure()):
+        target = "followups"
+    return redirect(target)
 
 
 @login_required
@@ -250,6 +267,38 @@ def retry_followup_alert(request, pk):
     return redirect("followups")
 
 
+class _EchoWriter:
+    """A file-like object that returns what it's written instead of buffering it.
+
+    Used with csv.writer so each row can be sent to the client as it's generated
+    (StreamingHttpResponse), instead of building the entire CSV in memory first -
+    this keeps memory flat and the response starts arriving immediately, however
+    many years of attendance history the export covers.
+    """
+
+    def write(self, value):
+        return value
+
+
+def _stream_csv(filename, header, rows):
+    writer = csv.writer(_EchoWriter())
+
+    def generate():
+        yield writer.writerow(header)
+        for row in rows:
+            yield writer.writerow(row)
+
+    response = StreamingHttpResponse(generate(), content_type="text/csv")
+    response["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return response
+
+
+def csv_safe(value):
+    """Neutralise spreadsheet formulas (=, +, -, @) in exported text."""
+    value = "" if value is None else str(value)
+    return "'" + value if value[:1] in ("=", "+", "-", "@", "\t", "\r") else value
+
+
 @login_required
 def report_queryset(request):
     """Return only the attendance records the requester is allowed to see."""
@@ -262,14 +311,19 @@ def report_queryset(request):
     status = request.GET.get("status")
     date_from = request.GET.get("from")
     date_to = request.GET.get("to")
-    if batch and batch.isdigit():
-        qs = qs.filter(session__batch_id=batch)
+    if batch and batch.isascii() and batch.isdigit() and len(batch) <= 12:
+        qs = qs.filter(session__batch_id=int(batch))
     if status in dict(Attendance.STATUS):
         qs = qs.filter(status=status)
-    if date_from:
-        qs = qs.filter(session__starts_at__date__gte=date_from)
-    if date_to:
-        qs = qs.filter(session__starts_at__date__lte=date_to)
+    # Malformed dates are ignored instead of crashing the page.
+    try:
+        start, end = parse_date(date_from or ""), parse_date(date_to or "")
+    except ValueError:
+        start = end = None
+    if start:
+        qs = qs.filter(session__starts_at__date__gte=start)
+    if end:
+        qs = qs.filter(session__starts_at__date__lte=end)
     return qs
 
 
@@ -282,29 +336,31 @@ def reports(request):
     if role(request) == "teacher" and not request.user.is_superuser:
         visible_batches = visible_batches.filter(teachers=request.user)
     if request.GET.get("format") == "csv":
-        response = HttpResponse(content_type="text/csv")
-        response["Content-Disposition"] = 'attachment; filename="attendance-report.csv"'
-        writer = csv.writer(response)
-        writer.writerow(["Date", "Student", "Roll number", "Batch", "Subject", "Status"])
-        for item in qs.iterator(chunk_size=500):
-            writer.writerow([
-                timezone.localtime(item.session.starts_at).strftime("%Y-%m-%d %H:%M"),
-                item.student.name, item.student.roll_number, item.session.batch.name,
-                item.session.subject.name if item.session.subject_id else "", item.status,
-            ])
-        return response
+        def rows():
+            for item in qs.iterator(chunk_size=500):
+                yield [
+                    timezone.localtime(item.session.starts_at).strftime("%Y-%m-%d %H:%M"),
+                    csv_safe(item.student.name), csv_safe(item.student.roll_number),
+                    csv_safe(item.session.batch.name),
+                    csv_safe(item.session.subject.name) if item.session.subject_id else "", item.status,
+                ]
+        return _stream_csv(
+            "attendance-report.csv", ["Date", "Student", "Roll number", "Batch", "Subject", "Status"], rows()
+        )
     if request.GET.get("format") == "summary_csv":
-        response = HttpResponse(content_type="text/csv")
-        response["Content-Disposition"] = 'attachment; filename="student-attendance-summary.csv"'
-        writer = csv.writer(response)
-        writer.writerow(["Roll number", "Student", "Present", "Late", "Absent", "Excused", "Total", "Attendance %"])
-        for r in student_summaries(qs):
-            writer.writerow([
-                r["student__roll_number"], r["student__name"], r["present"], r["late"],
-                r["absent"], r["excused"], r["total"],
-                "" if r["percentage"] is None else r["percentage"],
-            ])
-        return response
+        def rows():
+            for r in student_summaries(qs):
+                yield [
+                    csv_safe(r["student__roll_number"]), csv_safe(r["student__name"]), r["present"], r["late"],
+                    r["absent"], r["excused"], r["total"],
+                    "" if r["percentage"] is None else r["percentage"],
+                ]
+        return _stream_csv(
+            "student-attendance-summary.csv",
+            ["Roll number", "Student", "Present", "Late", "Absent", "Excused", "Total", "Attendance %"],
+            rows(),
+        )
+    student_page = Paginator(student_summaries(qs), settings.REPORT_PAGE_SIZE).get_page(request.GET.get("page"))
     return render(
         request,
         "core/reports.html",
@@ -313,7 +369,8 @@ def reports(request):
             "records": qs[:300],
             "counts": qs.order_by().values("status").annotate(total=Count("id")),
             "summary": attendance_summary(qs.order_by()),
-            "student_rows": student_summaries(qs),
+            "student_rows": student_page,
+            "page_obj": student_page,
             "batches": visible_batches,
             "statuses": Attendance.STATUS,
         },
@@ -385,8 +442,11 @@ def manage(request, kind, pk=None):
             else:
                 return redirect("batches")
         elif kind == "session":
-            created = form.save_with_repeats()
-            messages.success(request, f"{created} class{'es' if created != 1 else ''} scheduled.")
+            created, skipped = form.save_with_repeats()
+            msg = f"{created} class{'es' if created != 1 else ''} scheduled."
+            if skipped:
+                msg += f" {skipped} repeat{'s' if skipped != 1 else ''} skipped: the batch already had a class at that time."
+            messages.success(request, msg)
             return redirect("dashboard")
         else:
             form.save()
@@ -458,11 +518,81 @@ def whatsapp_webhook(request):
         return HttpResponseForbidden()
     try:
         payload = json.loads(request.body)
-    except ValueError:
-        return HttpResponse(status=400)
-    for entry in payload.get("entry", []):
-        for change in entry.get("changes", []):
-            for st in change.get("value", {}).get("statuses", []):
-                errors = st.get("errors") or [{}]
-                apply_delivery_receipt(st.get("id", ""), st.get("status", ""), errors[0].get("title", ""))
+        for entry in payload.get("entry", []):
+            for change in entry.get("changes", []):
+                for st in change.get("value", {}).get("statuses", []):
+                    errors = st.get("errors") or [{}]
+                    apply_delivery_receipt(
+                        str(st.get("id", "")), str(st.get("status", "")), str(errors[0].get("title", ""))
+                    )
+    except (ValueError, AttributeError, TypeError, IndexError):
+        return HttpResponse(status=400)  # malformed payload: never a 500
     return HttpResponse("ok")
+
+
+# --- Error pages: standalone templates that never touch the database -------------------------
+def _error(request, status, title, message):
+    return render(request, "core/error.html", {"status": status, "title": title, "message": message}, status=status)
+
+
+def bad_request(request, exception=None):
+    return _error(request, 400, "Bad request", "We could not understand that request.")
+
+
+def permission_denied(request, exception=None):
+    return _error(request, 403, "Not allowed", "You do not have permission to open this page.")
+
+
+def not_found(request, exception=None):
+    return _error(request, 404, "Page not found", "The page you are looking for does not exist.")
+
+
+def server_error(request):
+    return _error(request, 500, "Something went wrong", "An unexpected error occurred. Please try again in a moment.")
+
+
+def csrf_failure(request, reason=""):
+    return _error(request, 403, "Session expired", "Your form expired or the session changed. Go back, refresh the page and try again.")
+
+
+@login_required
+@require_http_methods(["GET", "POST"])
+def students_import(request):
+    """Bulk-create students from an uploaded CSV. Admin only; see IMPORT_TEMPLATE_CSV
+    for the expected columns. Designed for large institutes: thousands of rows are
+    validated and written in one request without one database round-trip per row."""
+    if not is_admin(request.user):
+        return HttpResponseForbidden()
+    result = None
+    if request.method == "POST":
+        upload = request.FILES.get("csv_file")
+        if not upload:
+            messages.error(request, "Choose a CSV file first.")
+        elif upload.size > settings.DATA_UPLOAD_MAX_MEMORY_SIZE:
+            messages.error(request, "That file is too large.")
+        else:
+            try:
+                text = upload.read().decode("utf-8-sig")
+            except UnicodeDecodeError:
+                messages.error(request, "The file must be UTF-8 encoded CSV.")
+            else:
+                reader = csv.DictReader(io.StringIO(text))
+                missing = {"name", "roll_number", "batch"} - set(h.strip() for h in (reader.fieldnames or []))
+                if missing:
+                    messages.error(request, f"Missing required column(s): {', '.join(sorted(missing))}.")
+                else:
+                    rows = list(reader)
+                    created, errors = bulk_import_students(rows)
+                    result = {"created": created, "errors": errors[:200], "error_count": len(errors)}
+                    if created:
+                        messages.success(request, f"{created} student{'s' if created != 1 else ''} imported.")
+    return render(request, "core/students_import.html", {**common(request), "result": result})
+
+
+@login_required
+def students_import_template(request):
+    if not is_admin(request.user):
+        return HttpResponseForbidden()
+    response = HttpResponse(IMPORT_TEMPLATE_CSV, content_type="text/csv")
+    response["Content-Disposition"] = 'attachment; filename="student-import-template.csv"'
+    return response

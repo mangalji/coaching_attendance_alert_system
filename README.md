@@ -86,3 +86,27 @@ This is intentionally a configurable single-institute deployment: branding and b
 
 ## Recommended next steps
 For larger deployments, add bulk student import, monitored background workers, and an automated backup policy.
+
+## Production checklist
+1. `.env`: `DJANGO_DEBUG=False`, a long random `DJANGO_SECRET_KEY`, `DJANGO_ALLOWED_HOSTS=your.domain`, `CSRF_TRUSTED_ORIGINS=https://your.domain`, `PUBLIC_BASE_URL=https://your.domain`.
+2. Serve over HTTPS only (cookies are `Secure`). Behind a proxy set `SECURE_PROXY_SSL_HEADER=True`, `FORCE_HTTPS=True` and `NUM_PROXIES=1` (otherwise login throttling sees only the proxy's IP).
+3. Use PostgreSQL/MySQL (`DATABASE_URL`) and back it up. Set `FIELD_ENCRYPTION_KEY` (changing `DJANGO_SECRET_KEY` without it would make the stored WhatsApp token unreadable).
+4. Configure real SMTP (`EMAIL_*`): OTP, invitations and password resets are all emailed.
+5. Run `python manage.py collectstatic --noinput` **with the same `DJANGO_DEBUG` value the app will run with** (mixing them is a known gotcha: the app falls back to unhashed/stale static files rather than crashing, but will warn in logs). Then `migrate`, `setup_institute`, and `python manage.py check --deploy`.
+6. Keep one alert worker running (`process_alerts --loop`); it also purges expired OTP/throttle/invite rows.
+7. `/admin/` is disabled unless `DJANGO_ADMIN_ENABLED=True`. Errors are logged to stdout (`LOG_LEVEL`).
+
+## Scaling to a large institute (thousands of students)
+- **Bulk-add students**: Students page → "Bulk import (CSV)" (admin only). Upload `name, roll_number, batch` (+ optional guardian columns); a sample file is one click away on that page. This writes the whole file in two database statements total, so importing thousands of rows takes well under a second — tested with 5,000 rows. It only creates student/attendance records, not portal logins (creating thousands of login invitations in one request would make that request itself time out); invite individual students to the portal afterwards the normal way.
+- **List and report pages stay at a fixed number of queries** regardless of institute size (Students, Team & accounts, and the per-student report table are paginated, `LIST_PAGE_SIZE`/`REPORT_PAGE_SIZE` env vars tune the page size). Tested at 5,000 students / 300,000 attendance rows: each page loads in well under half a second.
+- **CSV exports stream** row by row instead of building the file in memory, so a full multi-month export doesn't spike server memory or make the browser wait for the whole file before the download starts. For an export spanning years, prefer filtering by date range first, or use the "Student summary CSV" (aggregated, far smaller) for an institute-wide view.
+- For very large exports behind a reverse proxy, raise the proxy's read timeout for the `/reports/` path (a multi-year, full-detail export can run for tens of seconds).
+- Use PostgreSQL or MySQL in production (not SQLite) — see `DATABASE_URL` in `.env.example`; `DATABASE_CONN_MAX_AGE` controls connection pooling.
+
+## Extending the system (architecture for future features)
+- `core/models.py` — data model. `core/forms.py` — validation and input shaping. `core/services.py` — business logic (attendance, alerts, reports, bulk import) that views call into; put new domain logic here, not in views, so it stays testable and reusable (e.g. from a management command).
+- `core/views.py` / `core/accounts.py` — HTTP layer: authorization checks, then delegate to `services.py`.
+- A **new report**: add a query helper in `services.py` (see `attendance_summary`, `student_summaries`), then a view branch and a template section; reuse `_stream_csv` for any CSV download so large exports stay memory-safe automatically.
+- A **new notification channel** (e.g. SMS, email-to-parent) alongside WhatsApp: model it on `GuardianAlert`/`dispatch_guardian_alerts` — a queued row, a claim-then-send step, retry/backoff, and a management command run by the scheduler. Keep sending logic out of request/view code so a slow provider can never block a page load.
+- A **new role or portal**: `Profile.role` plus `core/access.py`'s scope helpers (`teacher_session_filter`) are the two places role-based visibility is defined; most views and templates branch on `role` consistently with this pattern.
+- A **new bulk-data entry point** (e.g. bulk teacher assignment): follow `bulk_import_students`'s shape — pre-fetch lookups once, validate in Python, write with `bulk_create`/bulk M2M `through` rows, return `(created, errors)` rather than failing the whole file on one bad row.

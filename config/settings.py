@@ -37,6 +37,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
+    "core.middleware.SecurityHeadersMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -66,7 +67,10 @@ AUTH_PASSWORD_VALIDATORS = [
     {
         "NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"
     },
-    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},
+    {
+        "NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
+        "OPTIONS": {"min_length": 10},
+    },
     {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
     {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
 ]
@@ -83,7 +87,7 @@ STORAGES = {
     "staticfiles": {
         "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"
         if _plain_static
-        else "whitenoise.storage.CompressedManifestStaticFilesStorage"
+        else "core.storage.LenientManifestStaticFilesStorage"
     },
 }
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
@@ -136,3 +140,35 @@ DEFAULT_COUNTRY_CODE = os.getenv("DEFAULT_COUNTRY_CODE", "91")
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "")
 WHITENOISE_USE_FINDERS = DEBUG or "test" in sys.argv
+
+# Number of reverse proxies in front of the app (0 = none). Needed so login throttling sees the
+# real client IP instead of the proxy's address.
+NUM_PROXIES = int(os.getenv("NUM_PROXIES", "0"))
+# Django's /admin/ is off in production unless explicitly enabled.
+DJANGO_ADMIN_ENABLED = os.getenv("DJANGO_ADMIN_ENABLED", "True" if DEBUG else "False").lower() == "true"
+SECURE_HSTS_INCLUDE_SUBDOMAINS = False
+CSRF_FAILURE_VIEW = "core.views.csrf_failure"
+
+# Errors must be visible in production logs (container stdout / journald).
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {"plain": {"format": "%(asctime)s %(levelname)s %(name)s: %(message)s"}},
+    "handlers": {"console": {"class": "logging.StreamHandler", "formatter": "plain"}},
+    "root": {"handlers": ["console"], "level": os.getenv("LOG_LEVEL", "INFO")},
+    "loggers": {
+        "django.request": {"handlers": ["console"], "level": "WARNING", "propagate": False},
+        "django.security": {"handlers": ["console"], "level": "WARNING", "propagate": False},
+    },
+}
+
+# A bulk student-import CSV for a large institute can run a few MB; raise Django's
+# conservative defaults so a legitimate file isn't rejected before validation runs.
+DATA_UPLOAD_MAX_MEMORY_SIZE = int(os.getenv("DATA_UPLOAD_MAX_MEMORY_SIZE", str(10 * 1024 * 1024)))
+FILE_UPLOAD_MAX_MEMORY_SIZE = DATA_UPLOAD_MAX_MEMORY_SIZE
+
+# Rows per page on list/report screens. Tune per deployment via env if an institute
+# wants denser or lighter pages; the query count on these pages does not change
+# with institute size, only with this number.
+LIST_PAGE_SIZE = int(os.getenv("LIST_PAGE_SIZE", "50"))
+REPORT_PAGE_SIZE = int(os.getenv("REPORT_PAGE_SIZE", "100"))

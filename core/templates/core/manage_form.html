@@ -4,7 +4,7 @@
 <h1>{{ title|title }}</h1>
 <section class="card">
   <form method="post">
-    {% csrf_token %} {{ form.as_p }} {% if batch_form %}
+    {% csrf_token %} {{ form.as_div }} {% if batch_form %}
     <hr />
     <h2>Subjects</h2>
     <p class="muted">
@@ -46,7 +46,12 @@
       const role = document.getElementById("id_role");
       function setHidden(name, hidden) {
         const field = document.getElementById("id_" + name);
-        if (field) (field.closest("p") || field.parentElement).hidden = hidden;
+        if (!field) return;
+        // Hide the field's whole wrapper: the direct child of the form that contains it.
+        let wrapper = field;
+        while (wrapper.parentElement && wrapper.parentElement.tagName !== "FORM")
+          wrapper = wrapper.parentElement;
+        if (wrapper.tagName !== "FORM") wrapper.hidden = hidden;
       }
       function update() {
         [
@@ -57,6 +62,17 @@
         ].forEach((n) => setHidden(n, role.value !== "student"));
         setHidden("batches", role.value === "admin");
         setHidden("subjects", role.value !== "teacher");
+      }
+      // UI-only role restriction: Students page opens this form with ?role=student.
+      if (new URLSearchParams(location.search).get("role") === "student") {
+        role.value = "student";
+        let box = role;
+        while (box.parentElement && box.parentElement.tagName !== "FORM")
+          box = box.parentElement;
+        box.hidden = true; // role is fixed to student, so hide the field
+      } else {
+        // Team & accounts: only teacher / administrator can be added here.
+        [...role.options].forEach((o) => o.value === "student" && o.remove());
       }
       role.addEventListener("change", update);
       update();

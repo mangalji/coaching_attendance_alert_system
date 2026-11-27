@@ -11,9 +11,11 @@ from django.contrib.auth.forms import SetPasswordForm
 from django.contrib.auth.hashers import check_password, make_password
 from django.contrib.auth.tokens import default_token_generator
 from django.core.mail import send_mail
-from django.db import transaction
+from django.db import IntegrityError, transaction
+from django.db.models import Q
 from django.http import HttpResponseForbidden
 from django.shortcuts import get_object_or_404, redirect, render
+from django.core.paginator import Paginator
 from django.urls import reverse
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
@@ -43,6 +45,33 @@ def role_of(user):
         return "admin"
     r = getattr(getattr(user, "profile", None), "role", None)
     return r if r in ("admin", "teacher", "student") else None
+
+
+def client_ip(request):
+    """Client address for throttling. Behind a reverse proxy set NUM_PROXIES (e.g. 1) so the
+    real client is read from X-Forwarded-For; with 0 the header is ignored (it is spoofable)."""
+    n = settings.NUM_PROXIES
+    if n:
+        parts = [x.strip() for x in request.META.get("HTTP_X_FORWARDED_FOR", "").split(",") if x.strip()]
+        if len(parts) >= n:
+            return parts[-n][:64]
+    return request.META.get("REMOTE_ADDR", "")[:64]
+
+
+_dummy_hash = None
+
+
+def burn_password_check(password):
+    """Spend the same time as a real password check so response time doesn't reveal valid emails."""
+    global _dummy_hash
+    if _dummy_hash is None:
+        _dummy_hash = make_password("timing-equaliser")
+    check_password(password, _dummy_hash)
+
+
+def is_pending_invite(user):
+    """Invited users have no password until they accept; deactivated users keep theirs."""
+    return not user.has_usable_password()
 
 
 def is_admin(user):
@@ -110,7 +139,7 @@ def sign_in(request, portal):
     error = ""
     if request.method == "POST" and form.is_valid():
         email = form.cleaned_data["email"].lower()
-        if limited("ip:" + request.META.get("REMOTE_ADDR", ""), 30) or limited(
+        if limited("ip:" + client_ip(request), 30) or limited(
             "login:" + email
         ):
             return page(request, "Sign in", form, "Too many attempts. Try later.")
@@ -124,6 +153,8 @@ def sign_in(request, portal):
             if len(users) == 1
             else None
         )
+        if len(users) != 1:
+            burn_password_check(form.cleaned_data["password"])
         if user and role_of(user) == portal:
             code = f"{secrets.randbelow(1000000):06d}"
             hashed = make_password(code)
@@ -250,40 +281,57 @@ def invite(request):
     if request.method == "POST" and form.is_valid():
         d = form.cleaned_data
         token = secrets.token_urlsafe(32)
-        with transaction.atomic():
-            u = User.objects.create_user(
-                username=d["email"].lower(),
-                email=d["email"].lower(),
-                first_name=d["name"][:150],
-                is_active=False,
-            )
-            Profile.objects.create(user=u, role=d["role"])
-            if d["role"] == "student":
-                s = Student.objects.create(
-                    user=u,
-                    name=d["name"],
-                    roll_number=d["roll_number"],
-                    guardian_name=d["guardian_name"],
-                    guardian_phone=d["guardian_phone"],
-                    guardian_whatsapp_opt_in=d["guardian_whatsapp_opt_in"],
+        try:
+            with transaction.atomic():
+                u = User.objects.create_user(
+                    username=d["email"].lower(),
+                    email=d["email"].lower(),
+                    first_name=d["name"][:150],
+                    is_active=False,
                 )
-                s.batches.set(d["batches"])
-            elif d["role"] == "teacher":
-                for batch in d["batches"]:
-                    batch.teachers.add(u)
-                for subject in d["subjects"]:
-                    subject.teachers.add(u)
-            Invitation.objects.create(
-                user=u,
-                digest=digest(token),
-                expires=timezone.now() + timedelta(hours=48),
+                Profile.objects.create(user=u, role=d["role"])
+                if d["role"] == "student":
+                    s = Student.objects.create(
+                        user=u,
+                        name=d["name"],
+                        roll_number=d["roll_number"],
+                        guardian_name=d["guardian_name"],
+                        guardian_phone=d["guardian_phone"],
+                        guardian_whatsapp_opt_in=d["guardian_whatsapp_opt_in"],
+                    )
+                    s.batches.set(d["batches"])
+                elif d["role"] == "teacher":
+                    for batch in d["batches"]:
+                        batch.teachers.add(u)
+                    for subject in d["subjects"]:
+                        subject.teachers.add(u)
+                Invitation.objects.create(
+                    user=u,
+                    digest=digest(token),
+                    expires=timezone.now() + timedelta(hours=48),
+                )
+        except IntegrityError:
+            form.add_error(None, "That email address or roll number was just registered by someone else. Please try again.")
+            u = None
+        if u is None:
+            return render(
+                request,
+                "core/manage_form.html",
+                {"form": form, "title": "Add User", "invite_form": True, "role": "admin",
+                 "institute": Institute.objects.first()},
             )
         try:
             deliver_invite(u, token)
         except Exception:
             return page(
-                request, "Invitation saved", error="Email failed. Use resend in Users."
+                request,
+                "Invitation saved",
+                error="The email could not be sent (check the SMTP settings). "
+                "Share this one-time link with the user yourself, valid for 48 hours:",
+                notice=invite_url(token),
+                landing=True,
             )
+        messages.success(request, f"Invitation sent to {u.email}.")
         return redirect("accounts")
     return render(
         request,
@@ -298,8 +346,12 @@ def invite(request):
     )
 
 
+def invite_url(token):
+    return settings.PUBLIC_BASE_URL.rstrip("/") + reverse("accept_invite", args=[token])
+
+
 def deliver_invite(user, token):
-    url = settings.PUBLIC_BASE_URL.rstrip("/") + reverse("accept_invite", args=[token])
+    url = invite_url(token)
     send_mail(
         "Your coaching portal invitation",
         f"Create your password within 48 hours: {url}",
@@ -326,12 +378,19 @@ def accounts(request):
     if selected != "all":
         qs = qs.filter(profile__role=selected)
 
+    search = request.GET.get("q", "").strip()[:140]
+    if search:
+        qs = qs.filter(Q(first_name__icontains=search) | Q(email__icontains=search))
+
+    page_obj = Paginator(qs, settings.LIST_PAGE_SIZE).get_page(request.GET.get("page"))
     return render(
         request,
         "core/accounts.html",
         {
-            "accounts": qs,
+            "accounts": page_obj,
+            "page_obj": page_obj,
             "selected": selected,
+            "q": search,
             "role": "admin",
             "institute": Institute.objects.first(),
         },
@@ -344,11 +403,23 @@ def edit_account(request, pk):
     if not is_admin(request.user):
         return HttpResponseForbidden()
     user = get_object_or_404(User, pk=pk, profile__role__in=ROLES)
+    was_active = user.is_active  # ModelForm validation mutates the instance, so remember it first
     form = UserAccountForm(request.POST or None, instance=user)
     if request.method == "POST" and form.is_valid():
-        form.save()
-        messages.success(request, "Account updated.")
-        return redirect("accounts")
+        if was_active and not form.cleaned_data["is_active"]:
+            others = (
+                User.objects.filter(is_active=True)
+                .filter(Q(is_superuser=True) | Q(profile__role="admin"))
+                .exclude(pk=user.pk)
+            )
+            if user.pk == request.user.pk:
+                form.add_error("is_active", "You cannot deactivate your own account.")
+            elif is_admin(user) and not others.exists():
+                form.add_error("is_active", "At least one active administrator must remain.")
+        if not form.errors:
+            form.save()
+            messages.success(request, "Account updated.")
+            return redirect("accounts")
     return render(
         request,
         "core/manage_form.html",
@@ -385,6 +456,9 @@ def resend(request, pk):
     u = get_object_or_404(
         User, pk=pk, is_active=False, profile__role__in=["admin", "teacher", "student"]
     )
+    if not is_pending_invite(u):
+        messages.error(request, "This account was deactivated, not invited. Re-activate it from Edit.")
+        return redirect("accounts")
     token = secrets.token_urlsafe(32)
     Invitation.objects.update_or_create(
         user=u,
@@ -397,7 +471,15 @@ def resend(request, pk):
     try:
         deliver_invite(u, token)
     except Exception:
-        return page(request, "Email failed", error="Check SMTP settings and retry.")
+        return page(
+            request,
+            "Email failed",
+            error="The email could not be sent (check the SMTP settings). "
+            "Share this new one-time link with the user yourself, valid for 48 hours:",
+            notice=invite_url(token),
+            landing=True,
+        )
+    messages.success(request, f"Invitation re-sent to {u.email}.")
     return redirect("accounts")
 
 
@@ -416,6 +498,12 @@ def accept(request, token):
             .first()
         )
         if not item:
+            return page(
+                request,
+                "Invitation unavailable",
+                error="Ask your administrator for a new invitation.",
+            )
+        if not is_pending_invite(item.user):  # a deactivated account cannot re-activate itself
             return page(
                 request,
                 "Invitation unavailable",
@@ -446,7 +534,7 @@ def forgot_password(request):
     form = ForgotPasswordForm(request.POST or None)
     if request.method == "POST" and form.is_valid():
         email = form.cleaned_data["email"].lower()
-        if limited("ip:" + request.META.get("REMOTE_ADDR", ""), 30) or limited("reset:" + email, 5):
+        if limited("ip:" + client_ip(request), 30) or limited("reset:" + email, 5):
             return page(request, "Reset password", form, "Too many attempts. Try later.")
         users = list(User.objects.filter(email__iexact=email, is_active=True)[:2])
         if len(users) == 1 and role_of(users[0]):

@@ -1,8 +1,9 @@
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import SimpleTestCase, TestCase
 from django.contrib.auth import get_user_model
 from django.utils import timezone
@@ -182,7 +183,15 @@ from django.core import mail
 from django.test import override_settings
 from django.core.exceptions import ValidationError
 
-from .services import apply_delivery_receipt, dispatch_guardian_alerts, normalize_phone, retry_alert
+from .services import (
+    apply_delivery_receipt,
+    claim_alert,
+    dispatch_guardian_alerts,
+    normalize_phone,
+    queue_due_notifications,
+    retry_alert,
+    save_attendance,
+)
 
 
 @override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend", PUBLIC_BASE_URL="http://testserver")
@@ -294,8 +303,8 @@ class EndToEndTests(TestCase):
         resp = admin_c.get("/reports/?status=absent")
         self.assertContains(resp, "Attendance by student")
         csv_resp = admin_c.get("/reports/?format=csv")
-        self.assertIn("Sam", csv_resp.content.decode())
-        self.assertIn("Roll number", admin_c.get("/reports/?format=summary_csv").content.decode())
+        self.assertIn("Sam", csv_body(csv_resp))
+        self.assertIn("Roll number", csv_body(admin_c.get("/reports/?format=summary_csv")))
 
         # admin account management pages work
         tina = User.objects.get(email="tina@x.com")
@@ -357,3 +366,415 @@ class EndToEndTests(TestCase):
         form.is_valid()
         with self.assertRaises(ValueError):
             save_batch_with_subjects(form, ["Chemistry"])
+
+
+class InviteUiTests(TestCase):
+    def test_invite_page_fields_are_wrapped_so_scripts_can_hide_them(self):
+        admin = User.objects.create_user("a@x.com", "a@x.com", "Adm1n-pass-77", is_superuser=True)
+        self.client.force_login(admin)
+        s = self.client.session
+        s["otp_verified"] = True
+        s.save()
+        html = self.client.get("/accounts/invite/").content.decode()
+        self.assertIn("<fieldset", html)  # as_div wrappers, not <p> broken by <div> checkboxes
+
+    @override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend", PUBLIC_BASE_URL="http://testserver")
+    def test_invite_link_shown_when_email_fails(self):
+        admin = User.objects.create_user("a@x.com", "a@x.com", "Adm1n-pass-77", is_superuser=True)
+        batch = Batch.objects.create(name="B")
+        self.client.force_login(admin)
+        s = self.client.session
+        s["otp_verified"] = True
+        s.save()
+        with patch("core.accounts.send_mail", side_effect=OSError("smtp down")):
+            resp = self.client.post("/accounts/invite/", {
+                "name": "T", "email": "t@x.com", "role": "student", "roll_number": "7", "batches": [batch.pk],
+            })
+        self.assertContains(resp, "http://testserver/invite/")
+        self.assertTrue(User.objects.filter(email="t@x.com", is_active=False).exists())
+
+
+@override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend", PUBLIC_BASE_URL="http://testserver")
+class SecurityHardeningTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_user("adm@x.com", "adm@x.com", "Adm1n-pass-77", is_superuser=True)
+        Profile.objects.create(user=self.admin, role="admin")
+        self.c = self.client_class(raise_request_exception=False)
+        self.c.force_login(self.admin)
+        s = self.c.session
+        s["otp_verified"] = True
+        s.save()
+
+    def test_bad_report_filters_never_500(self):
+        for q in ["from=abc", "to=2026-13-45", "batch=%C2%B2", "batch=" + "9" * 40, "status=<x>", "from=&to="]:
+            self.assertEqual(self.c.get("/reports/?" + q).status_code, 200, q)
+            self.assertEqual(self.c.get("/reports/?format=csv&" + q).status_code, 200, q)
+
+    def test_csv_formula_injection_is_neutralised(self):
+        b = Batch.objects.create(name="B")
+        st = Student.objects.create(name="=HYPERLINK(\"http://evil\")", roll_number="+1")
+        st.batches.add(b)
+        sess = Session.objects.create(batch=b, starts_at=timezone.now(), ends_at=timezone.now() + timedelta(hours=1))
+        Attendance.objects.create(session=sess, student=st, status="absent")
+        body = csv_body(self.c.get("/reports/?format=csv"))
+        self.assertIn("'=HYPERLINK", body)
+        self.assertIn("'+1", body)
+        self.assertNotIn(",=HYPERLINK", body)
+
+    def test_followup_redirect_is_not_open(self):
+        b = Batch.objects.create(name="B")
+        st = Student.objects.create(name="S", roll_number="1")
+        sess = Session.objects.create(batch=b, starts_at=timezone.now(), ends_at=timezone.now() + timedelta(hours=1))
+        att = Attendance.objects.create(session=sess, student=st, status="absent")
+        fu = FollowUp.objects.create(attendance=att)
+        r = self.c.post(f"/followups/{fu.pk}/update/", {"status": "contacted", "next": "https://evil.example/x"})
+        self.assertEqual(r["Location"], "/followups/")
+        r = self.c.post(f"/followups/{fu.pk}/update/", {"status": "contacted", "next": "//evil.example"})
+        self.assertEqual(r["Location"], "/followups/")
+
+    def test_admin_cannot_lock_themselves_out(self):
+        r = self.c.post(f"/accounts/{self.admin.pk}/edit/", {"first_name": "A", "email": "adm@x.com"})
+        self.assertEqual(r.status_code, 200)
+        self.admin.refresh_from_db()
+        self.assertTrue(self.admin.is_active)
+        # the last active administrator cannot be deactivated by another admin either
+        other = User.objects.create_user("o@x.com", "o@x.com", "Oth3r-pass-99")
+        Profile.objects.create(user=other, role="admin")
+        self.admin.is_active = False
+        self.admin.save()
+        o = self.client_class(raise_request_exception=False)
+        o.force_login(other)
+        s = o.session
+        s["otp_verified"] = True
+        s.save()
+        r = o.post(f"/accounts/{other.pk}/edit/", {"first_name": "O", "email": "o@x.com"})
+        self.assertEqual(r.status_code, 200)
+
+    def test_deactivated_user_cannot_reactivate_via_old_invite(self):
+        batch = Batch.objects.create(name="B")
+        with patch("core.accounts.send_mail"):
+            self.c.post("/accounts/invite/", {"name": "T", "email": "t@x.com", "role": "student",
+                                              "roll_number": "9", "batches": [batch.pk]})
+        user = User.objects.get(email="t@x.com")
+        self.assertFalse(user.has_usable_password())
+        user.set_password("Some-pass-12345")  # simulates an accepted account that is later deactivated
+        user.is_active = False
+        user.save()
+        self.assertEqual(self.c.post(f"/accounts/{user.pk}/resend/").status_code, 302)
+        self.assertEqual(len(mail.outbox), 0)  # no new invite for a deactivated (not pending) user
+
+    def test_security_headers_and_error_pages(self):
+        r = self.c.get("/dashboard/")
+        self.assertIn("frame-ancestors 'none'", r["Content-Security-Policy"])
+        self.assertIn("no-store", r["Cache-Control"])
+        r = self.c.get("/does-not-exist/")
+        self.assertContains(r, "Page not found", status_code=404)
+        r = self.client_class().get("/login/nonsense/")
+        self.assertEqual(r.status_code, 403)
+
+    def test_webhook_malformed_payload_is_400_not_500(self):
+        with override_settings(WHATSAPP_APP_SECRET="k"):
+            for body in (b"[]", b'{"entry": 5}', b'{"entry": [{"changes": [{"value": {"statuses": [1]}}]}]}', b"not json"):
+                sig = "sha256=" + hmac.new(b"k", body, hashlib.sha256).hexdigest()
+                r = self.client.post("/webhooks/whatsapp/", body, content_type="application/json", HTTP_X_HUB_SIGNATURE_256=sig)
+                self.assertEqual(r.status_code, 400, body)
+
+    def test_login_throttle_uses_forwarded_ip_only_when_proxies_configured(self):
+        from django.test import RequestFactory
+        from .accounts import client_ip
+        req = RequestFactory().get("/", HTTP_X_FORWARDED_FOR="6.6.6.6, 203.0.113.9", REMOTE_ADDR="10.0.0.1")
+        with override_settings(NUM_PROXIES=0):
+            self.assertEqual(client_ip(req), "10.0.0.1")  # spoofable header ignored
+        with override_settings(NUM_PROXIES=1):
+            self.assertEqual(client_ip(req), "203.0.113.9")  # proxy-appended address, not the spoofed one
+
+    def test_login_lockout_after_repeated_failures(self):
+        User.objects.create_user("v@x.com", "v@x.com", "Right-pass-12345")
+        Profile.objects.create(user=User.objects.get(email="v@x.com"), role="teacher")
+        c = self.client_class()
+        for _ in range(8):
+            c.post("/login/teacher/", {"email": "v@x.com", "password": "wrong"})
+        r = c.post("/login/teacher/", {"email": "v@x.com", "password": "Right-pass-12345"})
+        self.assertContains(r, "Too many attempts")
+
+    def test_student_and_teacher_cannot_reach_admin_pages(self):
+        for role_name, urls in (("student", ["/students/", "/reports/", "/followups/", "/settings/", "/accounts/",
+                                              "/manage/batch/", "/accounts/invite/"]),
+                                ("teacher", ["/settings/", "/accounts/", "/manage/batch/", "/accounts/invite/"])):
+            u = User.objects.create_user(f"{role_name}@z.com", f"{role_name}@z.com", "Xx-pass-123456")
+            Profile.objects.create(user=u, role=role_name)
+            c = self.client_class(raise_request_exception=False)
+            c.force_login(u)
+            s = c.session
+            s["otp_verified"] = True
+            s.save()
+            for url in urls:
+                self.assertEqual(c.get(url).status_code, 403, (role_name, url))
+            self.assertEqual(c.post("/manage/batch/", {"name": "Hack"}).status_code, 403)
+        self.assertFalse(Batch.objects.filter(name="Hack").exists())
+
+    def test_session_without_otp_is_rejected(self):
+        c = self.client_class()
+        c.force_login(self.admin)  # logged in but never passed OTP
+        self.assertEqual(c.get("/dashboard/").status_code, 302)
+        self.assertEqual(c.get("/admin/").status_code, 302)
+
+
+def csv_body(response):
+    """Read a StreamingHttpResponse's full body in tests."""
+    return b"".join(response.streaming_content).decode()
+
+
+class FuzzyInt(int):
+    """Lets assertNumQueries accept a range instead of one exact count (brittle across Django versions)."""
+    def __new__(cls, low, high):
+        obj = super().__new__(cls, high)
+        obj.low, obj.high = low, high
+        return obj
+    def __eq__(self, other):
+        return self.low <= other <= self.high
+    def __repr__(self):
+        return f"[{self.low}..{self.high}]"
+
+
+class HostHeaderTests(TestCase):
+    def test_unknown_host_is_a_clean_400(self):
+        r = self.client_class(raise_request_exception=False).get("/login/", HTTP_HOST="evil.example")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("Content-Security-Policy", r)
+
+
+@override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend", PUBLIC_BASE_URL="http://testserver")
+class EdgeCaseTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_user("adm2@x.com", "adm2@x.com", "Adm1n-pass-77", is_superuser=True)
+        Profile.objects.create(user=self.admin, role="admin")
+        self.c = self.client_class(raise_request_exception=False)
+        self.c.force_login(self.admin)
+        s = self.c.session
+        s["otp_verified"] = True
+        s.save()
+        self.institute = Institute.objects.create(
+            name="Demo", whatsapp_enabled=True, alert_delay_minutes=1,
+            whatsapp_phone_number_id="1", whatsapp_template_name="t",
+        )
+        self.institute.set_whatsapp_access_token("tok")
+        self.institute.save()
+        self.batch = Batch.objects.create(name="B")
+
+    def _absent_alert(self, active=True):
+        st = Student.objects.create(
+            name="S", roll_number="1", guardian_phone="919999999999",
+            guardian_whatsapp_opt_in=True, active=active,
+        )
+        st.batches.add(self.batch)
+        sess = Session.objects.create(
+            batch=self.batch, starts_at=timezone.now(), ends_at=timezone.now() + timedelta(hours=1),
+            attendance_finalized=True, finalized_at=timezone.now() - timedelta(minutes=5),
+        )
+        att = save_attendance(sess, st, "absent", self.admin)
+        alert = GuardianAlert.objects.create(attendance=att)
+        return att, alert, st
+
+    def test_corrected_attendance_cancels_in_flight_alert_instead_of_sending(self):
+        """An alert claimed for sending must re-check status, not rely on a stale read."""
+        att, alert, st = self._absent_alert()
+        with patch("core.services.claim_alert", wraps=claim_alert) as claimed, \
+             patch("core.services.requests.post") as post:
+            def fix_before_send(alert_id):
+                # Simulate a teacher correcting the record the instant after it was claimed.
+                result = claim_alert(alert_id)
+                save_attendance(att.session, st, "present", self.admin)
+                return result
+            claimed.side_effect = fix_before_send
+            dispatch_guardian_alerts()
+            post.assert_not_called()
+        alert.refresh_from_db()
+        self.assertEqual(alert.status, "cancelled")
+
+    def test_deactivated_student_does_not_get_queued_or_sent(self):
+        att, alert, st = self._absent_alert(active=False)
+        self.assertEqual(queue_due_notifications(), 0)  # never queued fresh
+        with patch("core.services.requests.post") as post:
+            dispatch_guardian_alerts()
+            post.assert_not_called()
+        alert.refresh_from_db()
+        self.assertEqual(alert.status, "cancelled")
+
+    def test_delivery_receipt_ignores_unknown_status_and_wont_regress(self):
+        att, alert, st = self._absent_alert()
+        alert.status, alert.provider_message_id, alert.delivery_status = "sent", "wamid.9", "delivered"
+        alert.save()
+        self.assertFalse(apply_delivery_receipt("wamid.9", "something_new_meta_added"))
+        alert.refresh_from_db()
+        self.assertEqual(alert.delivery_status, "delivered")  # unknown status ignored
+        self.assertFalse(apply_delivery_receipt("wamid.9", "sent"))  # can't go backwards
+        alert.refresh_from_db()
+        self.assertEqual(alert.delivery_status, "delivered")
+        self.assertTrue(apply_delivery_receipt("wamid.9", "read"))
+        alert.refresh_from_db()
+        self.assertEqual(alert.delivery_status, "read")
+
+    def test_weekly_repeat_is_dst_safe_and_reports_clashes(self):
+        from .forms import SessionForm
+        with override_settings(TIME_ZONE="America/New_York", USE_TZ=True):
+            start = timezone.make_aware(datetime(2027, 3, 7, 18, 0), timezone.get_current_timezone())
+            form = SessionForm({
+                "batch": self.batch.pk, "starts_at": timezone.localtime(start).strftime("%Y-%m-%dT%H:%M"),
+                "ends_at": timezone.localtime(start + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M"),
+                "repeat_weekly_until": "2027-03-21",
+            })
+            self.assertTrue(form.is_valid(), form.errors)
+            created, skipped = form.save_with_repeats()
+            self.assertEqual((created, skipped), (3, 0))
+            hours = sorted({timezone.localtime(s.starts_at).hour for s in Session.objects.all()})
+            self.assertEqual(hours, [18])  # stays at 6 PM local across the US DST change (Mar 14, 2027)
+
+    def test_weekly_repeat_reports_clash_with_existing_session(self):
+        from .forms import SessionForm
+        week2 = timezone.now().replace(hour=10, minute=0, second=0, microsecond=0) + timedelta(weeks=1)
+        Session.objects.create(batch=self.batch, starts_at=week2, ends_at=week2 + timedelta(hours=1))
+        start = week2 - timedelta(weeks=1)
+        form = SessionForm({
+            "batch": self.batch.pk, "starts_at": timezone.localtime(start).strftime("%Y-%m-%dT%H:%M"),
+            "ends_at": timezone.localtime(start + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M"),
+            "repeat_weekly_until": (timezone.localdate() + timedelta(weeks=2)).isoformat(),
+        })
+        self.assertTrue(form.is_valid(), form.errors)
+        created, skipped = form.save_with_repeats()
+        self.assertEqual(skipped, 1)
+
+    def test_subject_name_duplicate_is_case_insensitively_blocked(self):
+        from .forms import SubjectForm
+        Subject.objects.create(batch=self.batch, name="Maths")
+        form = SubjectForm({"batch": self.batch.pk, "name": "maths"})
+        self.assertFalse(form.is_valid())
+        self.assertIn("name", form.errors)
+
+    def test_institute_settings_cannot_create_duplicate_rows(self):
+        Institute.objects.all().delete()
+        from .forms import InstituteSettingsForm
+        for name in ("First Try", "Second Try"):
+            form = InstituteSettingsForm({"name": name, "alert_delay_minutes": 10}, instance=Institute.objects.first())
+            self.assertTrue(form.is_valid(), form.errors)
+            form.save()
+        self.assertEqual(Institute.objects.count(), 1)
+        self.assertEqual(Institute.objects.get().name, "Second Try")
+
+    def test_students_search_and_pagination(self):
+        for i in range(55):
+            Student.objects.create(name=f"Zed {i}", roll_number=f"Z{i}")
+        Student.objects.create(name="Findme Kumar", roll_number="FK1")
+        r1 = self.c.get("/students/")
+        self.assertContains(r1, "Page 1 of 2")
+        r2 = self.c.get("/students/?page=2")
+        self.assertContains(r2, "Page 2 of 2")
+        r3 = self.c.get("/students/?q=Findme")
+        self.assertContains(r3, "Findme Kumar")
+        self.assertNotContains(r3, "Zed 1<")
+
+    def test_accounts_search_and_pagination(self):
+        for i in range(55):
+            u = User.objects.create_user(f"teach{i}@x.com", f"teach{i}@x.com", "Teach-pass-1234")
+            Profile.objects.create(user=u, role="teacher")
+        r1 = self.c.get("/accounts/")
+        self.assertContains(r1, "Page 1 of 2")
+        r2 = self.c.get("/accounts/?q=teach7@x.com")
+        self.assertContains(r2, "teach7@x.com")
+
+
+@override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend", PUBLIC_BASE_URL="http://testserver")
+class BulkImportAndScaleTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_user("bulk@x.com", "bulk@x.com", "Adm1n-pass-77", is_superuser=True)
+        Profile.objects.create(user=self.admin, role="admin")
+        self.c = self.client_class(raise_request_exception=False)
+        self.c.force_login(self.admin)
+        s = self.c.session
+        s["otp_verified"] = True
+        s.save()
+        self.batch = Batch.objects.create(name="JEE 2027", active=True)
+        Student.objects.create(name="Existing", roll_number="DUP1")
+
+    def _csv(self, rows):
+        header = "name,roll_number,batch,guardian_name,guardian_phone,guardian_whatsapp_opt_in\n"
+        return header + "\n".join(rows)
+
+    def test_valid_rows_are_bulk_created_with_batch_links(self):
+        from .services import bulk_import_students
+        rows = [
+            {"name": "A", "roll_number": "R1", "batch": "jee 2027", "guardian_name": "", "guardian_phone": "", "guardian_whatsapp_opt_in": ""},
+            {"name": "B", "roll_number": "R2", "batch": "JEE 2027", "guardian_name": "G", "guardian_phone": "9876543210", "guardian_whatsapp_opt_in": "yes"},
+        ]
+        created, errors = bulk_import_students(rows)
+        self.assertEqual((created, errors), (2, []))
+        b = Student.objects.get(roll_number="R2")
+        self.assertEqual(b.guardian_phone, "919876543210")
+        self.assertIn(self.batch, b.batches.all())
+
+    def test_bad_rows_are_skipped_with_reasons_not_a_hard_failure(self):
+        from .services import bulk_import_students
+        rows = [
+            {"name": "", "roll_number": "R3", "batch": "JEE 2027"},  # missing name
+            {"name": "C", "roll_number": "DUP1", "batch": "JEE 2027"},  # exists in DB
+            {"name": "D", "roll_number": "R4", "batch": "JEE 2027"},  # ok
+            {"name": "E", "roll_number": "R4", "batch": "JEE 2027"},  # duplicate within file
+            {"name": "F", "roll_number": "R5", "batch": "No Such Batch"},  # unknown batch
+            {"name": "G", "roll_number": "R6", "batch": "JEE 2027", "guardian_phone": "12345"},  # bad phone
+            {"name": "H", "roll_number": "R7", "batch": "JEE 2027", "guardian_whatsapp_opt_in": "yes"},  # opt-in no phone
+        ]
+        created, errors = bulk_import_students(rows)
+        self.assertEqual(created, 1)
+        self.assertEqual(len(errors), 6)
+        self.assertTrue(Student.objects.filter(roll_number="R4").exists())
+
+    def test_oversized_file_is_rejected_before_processing(self):
+        from .services import bulk_import_students, MAX_IMPORT_ROWS
+        rows = [{"name": "X", "roll_number": str(i), "batch": "JEE 2027"} for i in range(MAX_IMPORT_ROWS + 1)]
+        created, errors = bulk_import_students(rows)
+        self.assertEqual(created, 0)
+        self.assertIn("split it into files", errors[0][1])
+
+    def test_import_view_end_to_end(self):
+        csv_text = self._csv(["New One,IMP1,JEE 2027,,,no", "Bad Row,,JEE 2027,,,no"])
+        upload = SimpleUploadedFile("students.csv", csv_text.encode(), content_type="text/csv")
+        r = self.c.post("/students/import/", {"csv_file": upload})
+        self.assertContains(r, "1 student imported")
+        self.assertContains(r, "1 row")  # skipped count shown
+        self.assertTrue(Student.objects.filter(roll_number="IMP1").exists())
+
+    def test_import_requires_admin(self):
+        u = User.objects.create_user("teach@x.com", "teach@x.com", "Teach-pass-123")
+        Profile.objects.create(user=u, role="teacher")
+        c = self.client_class(raise_request_exception=False)
+        c.force_login(u)
+        s = c.session
+        s["otp_verified"] = True
+        s.save()
+        self.assertEqual(c.get("/students/import/").status_code, 403)
+        csv_text = self._csv(["X,RX1,JEE 2027,,,no"])
+        upload = SimpleUploadedFile("s.csv", csv_text.encode(), content_type="text/csv")
+        self.assertEqual(c.post("/students/import/", {"csv_file": upload}).status_code, 403)
+
+    def test_dashboard_session_list_has_no_subject_n_plus_one(self):
+        for i in range(10):
+            sub = Subject.objects.create(batch=self.batch, name=f"Sub{i}")
+            Session.objects.create(
+                batch=self.batch, subject=sub,
+                starts_at=timezone.now() - timedelta(days=i), ends_at=timezone.now() - timedelta(days=i) + timedelta(hours=1),
+            )
+        with self.assertNumQueries(FuzzyInt(1, 9)):
+            self.c.get("/dashboard/")
+
+    def test_reports_student_summary_is_paginated_at_scale(self):
+        for i in range(150):
+            st = Student.objects.create(name=f"Stu{i:03d}", roll_number=f"P{i:03d}")
+            st.batches.add(self.batch)
+            sess = Session.objects.create(
+                batch=self.batch, starts_at=timezone.now(), ends_at=timezone.now() + timedelta(hours=1),
+                attendance_finalized=True,
+            )
+            Attendance.objects.create(session=sess, student=st, status="present")
+        r = self.c.get("/reports/")
+        self.assertContains(r, "Page 1 of 2")
+        self.assertEqual(r.context["student_rows"].paginator.count, 150)

@@ -2,7 +2,7 @@ import time
 
 from django.core.management.base import BaseCommand
 
-from core.services import dispatch_pending_notifications
+from core.services import dispatch_pending_notifications, purge_expired
 
 
 class Command(BaseCommand):
@@ -19,6 +19,7 @@ class Command(BaseCommand):
         while True:
             try:
                 self.stdout.write(str(dispatch_pending_notifications()))
+                purge_expired()
             except Exception as exc:  # keep the worker alive across transient DB/network errors
                 if not options["loop"]:
                     raise

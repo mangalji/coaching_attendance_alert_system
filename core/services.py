@@ -11,7 +11,20 @@ from django.db import transaction
 from django.db.models import Count, F, Q
 from django.utils import timezone
 
-from .models import Attendance, AttendanceAudit, FollowUp, GuardianAlert, Institute, Notification, Subject
+from .models import (
+    AuthThrottle,
+    Attendance,
+    AttendanceAudit,
+    Batch,
+    FollowUp,
+    GuardianAlert,
+    Institute,
+    Invitation,
+    LoginChallenge,
+    Notification,
+    Student,
+    Subject,
+)
 
 
 MAX_ALERT_ATTEMPTS = 3
@@ -157,6 +170,7 @@ def queue_due_notifications():
             student__guardian_whatsapp_opt_in=True,
         )
         .select_related("student", "session__batch")
+        .filter(student__active=True)
         .exclude(guardianalert__isnull=False)
     )
     count = 0
@@ -260,7 +274,16 @@ def dispatch_guardian_alerts(limit=50):
         if not claim_alert(alert.pk):
             continue
         alert.refresh_from_db()
-        if attendance.status != "absent" or not student.guardian_whatsapp_opt_in or not student.guardian_phone:
+        # Re-read: the cached attendance/student above may be stale by the time the claim lands
+        # (e.g. a teacher just corrected absent -> present, or the student was deactivated).
+        attendance.refresh_from_db()
+        student.refresh_from_db()
+        if (
+            attendance.status != "absent"
+            or not student.active
+            or not student.guardian_whatsapp_opt_in
+            or not student.guardian_phone
+        ):
             alert.status = "cancelled"
             alert.save(update_fields=["status"])
             continue
@@ -291,16 +314,24 @@ def dispatch_guardian_alerts(limit=50):
 
 
 def apply_delivery_receipt(message_id, status, error=""):
-    """Record a Meta delivery receipt (sent/delivered/read/failed) for an alert."""
+    """Record a Meta delivery receipt (sent/delivered/read/failed) for an alert.
+
+    Unrecognised status values (future Meta additions we don't model yet) are ignored
+    rather than stored verbatim, and a receipt can never move delivery_status backwards.
+    """
     alert = GuardianAlert.objects.filter(provider_message_id=message_id).first()
-    if not alert:
+    if not alert or alert.delivery_status == "failed":
+        return False  # unknown message id, or already in its terminal state
+    order = {"sent": 1, "delivered": 2, "read": 3, "failed": 4}
+    if status not in order:
         return False
-    order = {"sent": 1, "delivered": 2, "read": 3}
     if status == "failed":
         alert.delivery_status, alert.status = "failed", "failed"
         alert.last_error = (error or "Delivery failed")[:1000]
-    elif order.get(status, 0) >= order.get(alert.delivery_status, 0):
+    elif order[status] >= order.get(alert.delivery_status, 0):
         alert.delivery_status = status
+    else:
+        return False
     alert.save(update_fields=["delivery_status", "status", "last_error"])
     return True
 
@@ -309,3 +340,96 @@ def dispatch_pending_notifications(limit=50):
     """Backward-compatible entry point for installations using the original command API."""
     queue_due_notifications()
     return dispatch_guardian_alerts(limit)
+
+
+def purge_expired():
+    """Delete expired throttle counters, OTP challenges and stale invitations (keeps tables small)."""
+    now = timezone.now()
+    AuthThrottle.objects.filter(expires__lt=now).delete()
+    LoginChallenge.objects.filter(expires__lt=now).delete()
+    Invitation.objects.filter(Q(used=True) | Q(expires__lt=now - timedelta(days=30))).delete()
+
+
+MAX_IMPORT_ROWS = 10000
+
+
+def bulk_import_students(rows):
+    """Create Student records from parsed CSV rows: name, roll_number, batch,
+    guardian_name, guardian_phone, guardian_whatsapp_opt_in.
+
+    Built for large institutes (thousands of rows in one file): batch names and
+    existing roll numbers are each fetched once (not once per row), and the new
+    students and their batch links are written with two bulk_create calls total,
+    regardless of row count, instead of one write per student.
+
+    This only creates student/attendance records; it does not create portal login
+    accounts, since generating thousands of invitation emails inline would make the
+    request itself time out. Invite individual students to the portal afterwards,
+    the normal way, once they're enrolled.
+
+    Returns (created_count, errors): errors is a list of (row_number, message).
+    """
+    if len(rows) > MAX_IMPORT_ROWS:
+        return 0, [(0, f"File has {len(rows)} rows; split it into files of {MAX_IMPORT_ROWS} or fewer.")]
+
+    batches_by_name = {b.name.casefold(): b for b in Batch.objects.filter(active=True)}
+    existing_rolls = set(Student.objects.values_list("roll_number", flat=True))
+    seen_rolls_in_file = {}
+    errors = []
+    to_create = []
+
+    for i, row in enumerate(rows, start=2):  # row 1 is the header
+        name = (row.get("name") or "").strip()[:150]
+        roll = (row.get("roll_number") or "").strip()[:40]
+        batch_name = (row.get("batch") or "").strip()
+        if not name or not roll or not batch_name:
+            errors.append((i, "name, roll_number and batch are required."))
+            continue
+        if roll in existing_rolls:
+            errors.append((i, f"Roll number '{roll}' already exists."))
+            continue
+        if roll in seen_rolls_in_file:
+            errors.append((i, f"Roll number '{roll}' is duplicated in this file (also row {seen_rolls_in_file[roll]})."))
+            continue
+        batch = batches_by_name.get(batch_name.casefold())
+        if not batch:
+            errors.append((i, f"No active batch named '{batch_name}'."))
+            continue
+        opt_in = (row.get("guardian_whatsapp_opt_in") or "").strip().lower() in ("yes", "y", "true", "1")
+        try:
+            phone = normalize_phone(row.get("guardian_phone"))
+        except ValidationError as exc:
+            errors.append((i, str(exc.messages[0])))
+            continue
+        if opt_in and not phone:
+            errors.append((i, "guardian_whatsapp_opt_in is yes but guardian_phone is blank."))
+            continue
+        seen_rolls_in_file[roll] = i
+        to_create.append((
+            Student(
+                name=name, roll_number=roll,
+                guardian_name=(row.get("guardian_name") or "").strip()[:150],
+                guardian_phone=phone, guardian_whatsapp_opt_in=opt_in,
+            ),
+            batch,
+        ))
+
+    if not to_create:
+        return 0, errors
+
+    with transaction.atomic():
+        created = Student.objects.bulk_create([s for s, _ in to_create], batch_size=500)
+        # bulk_create returns the objects with pks populated (SQLite/Postgres/MySQL all
+        # support this for simple single-table inserts), so the batch M2M link can also
+        # be written in one bulk statement instead of one `.add()` call per student.
+        through = Student.batches.through
+        links = [through(student_id=s.pk, batch_id=b.pk) for s, b in zip(created, (b for _, b in to_create))]
+        through.objects.bulk_create(links, batch_size=500)
+    return len(created), errors
+
+
+IMPORT_TEMPLATE_CSV = (
+    "name,roll_number,batch,guardian_name,guardian_phone,guardian_whatsapp_opt_in\n"
+    "Asha Verma,J27-001,JEE 2027,Mrs Verma,9876543210,yes\n"
+    "Rohit Singh,J27-002,JEE 2027,Mr Singh,9876543211,no\n"
+)

@@ -41,7 +41,9 @@
       </option>
     </select>
 
+    <input type="search" name="q" value="{{ q }}" placeholder="Search by name or email" />
     <button type="submit">Filter</button>
+    {% if q or selected != 'all' %}<a class="text-action" href="{% url 'accounts' %}">Clear</a>{% endif %}
   </form>
 </section>
 
@@ -97,12 +99,13 @@
       {% empty %}
 
       <tr>
-        <td colspan="5">No users found.</td>
+        <td colspan="5">{% if q %}No users match &quot;{{ q }}&quot;.{% else %}No users found.{% endif %}</td>
       </tr>
 
       {% endfor %}
     </tbody>
   </table>
+  {% include "core/_pagination.html" %}
 </section>
 
 {% endblock %}
