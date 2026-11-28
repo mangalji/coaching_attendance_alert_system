@@ -149,11 +149,12 @@ def batches(request):
 
 
 @login_required
-@transaction.atomic
 def attendance(request, pk):
-    session = get_object_or_404(
-        Session.objects.select_for_update().select_related("batch"), pk=pk
-    )
+    # Plain (unlocked) fetch for the authorization check and for GET: a row lock here
+    # would be held for the whole request, including ones we're about to reject, which
+    # lets anyone who can merely log in (any role, any session id) stall a real teacher's
+    # concurrent attempt to mark/finalize attendance just by holding requests open.
+    session = get_object_or_404(Session.objects.select_related("batch"), pk=pk)
     if not allowed(request, "admin", "teacher"):
         return HttpResponseForbidden()
     if (
@@ -174,14 +175,18 @@ def attendance(request, pk):
         if any(request.POST.get(f"status_{s.pk}") not in valid for s in students):
             messages.error(request, "Please select a status for every student.")
             return redirect("attendance", pk=pk)
-        for student in students:
-            save_attendance(
-                session, student, request.POST[f"status_{student.pk}"], request.user
-            )
-        if request.POST.get("finalize") == "yes":
-            session.attendance_finalized = True
-            session.finalized_at = timezone.now()
-            session.save(update_fields=["attendance_finalized", "finalized_at"])
+        with transaction.atomic():
+            # Lock is taken here, only for an already-authorized write, and only for
+            # as long as the actual save takes - not for the whole request/response.
+            session = Session.objects.select_for_update().get(pk=session.pk)
+            for student in students:
+                save_attendance(
+                    session, student, request.POST[f"status_{student.pk}"], request.user
+                )
+            if request.POST.get("finalize") == "yes":
+                session.attendance_finalized = True
+                session.finalized_at = timezone.now()
+                session.save(update_fields=["attendance_finalized", "finalized_at"])
         messages.success(request, "Attendance saved successfully.")
         return redirect("attendance", pk=pk)
     return render(
@@ -583,9 +588,12 @@ def students_import(request):
                 else:
                     rows = list(reader)
                     created, errors = bulk_import_students(rows)
-                    result = {"created": created, "errors": errors[:200], "error_count": len(errors)}
-                    if created:
-                        messages.success(request, f"{created} student{'s' if created != 1 else ''} imported.")
+                    if errors and errors[0][0] == 0:
+                        messages.error(request, errors[0][1])  # whole-file error, not a per-row one
+                    else:
+                        result = {"created": created, "errors": errors[:200], "error_count": len(errors)}
+                        if created:
+                            messages.success(request, f"{created} student{'s' if created != 1 else ''} imported.")
     return render(request, "core/students_import.html", {**common(request), "result": result})
 
 

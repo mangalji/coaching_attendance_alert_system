@@ -1,5 +1,8 @@
 import hashlib
+import logging
+import random
 import secrets
+import time
 from datetime import timedelta
 
 from django import forms
@@ -37,6 +40,7 @@ from .forms import UserAccountForm
 from .services import normalize_phone
 
 User = get_user_model()
+logger = logging.getLogger(__name__)
 ROLES = ("admin", "teacher", "student")
 
 
@@ -552,7 +556,15 @@ def forgot_password(request):
                     [user.email],
                 )
             except Exception:
-                return page(request, "Reset password", form, "Email delivery failed. Contact administrator.")
+                # Never say this to the requester: "delivery failed" vs. the generic
+                # message below would itself reveal that the address has an account.
+                # An operator needs to know SMTP is broken, so that goes to the log instead.
+                logger.warning("Password-reset email failed to send for %s", user.pk)
+        else:
+            # No account to email: spend roughly the same wall-clock time as the real
+            # send above anyway, so response time doesn't reveal account existence.
+            burn_password_check(form.cleaned_data["email"])
+            time.sleep(random.uniform(0.15, 0.35))
         return page(
             request,
             "Check your email",

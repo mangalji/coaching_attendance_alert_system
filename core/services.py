@@ -7,7 +7,7 @@ from datetime import timedelta
 import requests
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Count, F, Q
 from django.utils import timezone
 
@@ -417,14 +417,22 @@ def bulk_import_students(rows):
     if not to_create:
         return 0, errors
 
-    with transaction.atomic():
-        created = Student.objects.bulk_create([s for s, _ in to_create], batch_size=500)
-        # bulk_create returns the objects with pks populated (SQLite/Postgres/MySQL all
-        # support this for simple single-table inserts), so the batch M2M link can also
-        # be written in one bulk statement instead of one `.add()` call per student.
-        through = Student.batches.through
-        links = [through(student_id=s.pk, batch_id=b.pk) for s, b in zip(created, (b for _, b in to_create))]
-        through.objects.bulk_create(links, batch_size=500)
+    try:
+        with transaction.atomic():
+            created = Student.objects.bulk_create([s for s, _ in to_create], batch_size=500)
+            # bulk_create returns the objects with pks populated (SQLite/Postgres/MySQL all
+            # support this for simple single-table inserts), so the batch M2M link can also
+            # be written in one bulk statement instead of one `.add()` call per student.
+            through = Student.batches.through
+            links = [through(student_id=s.pk, batch_id=b.pk) for s, b in zip(created, (b for _, b in to_create))]
+            through.objects.bulk_create(links, batch_size=500)
+    except IntegrityError:
+        # Someone else's import (or a single "Add Student") created one of these exact
+        # roll numbers in the moment between our uniqueness check above and this write.
+        # The whole batch is rolled back together (bulk_create is one statement), so
+        # nothing is partially saved - tell the admin plainly instead of a raw 500.
+        return 0, [(0, "Another import or enrollment ran at the same time and used one of "
+                       "these roll numbers. Nothing was saved - please re-upload the file.")]
     return len(created), errors
 
 

@@ -1,9 +1,11 @@
 import os
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import IntegrityError
 from django.test import SimpleTestCase, TestCase
 from django.contrib.auth import get_user_model
 from django.utils import timezone
@@ -778,3 +780,88 @@ class BulkImportAndScaleTests(TestCase):
         r = self.c.get("/reports/")
         self.assertContains(r, "Page 1 of 2")
         self.assertEqual(r.context["student_rows"].paginator.count, 150)
+
+
+@override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend", PUBLIC_BASE_URL="http://testserver")
+class SecurityAuditFixesTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_user("sec@x.com", "sec@x.com", "Adm1n-pass-77", is_superuser=True)
+        Profile.objects.create(user=self.admin, role="admin")
+        self.batch = Batch.objects.create(name="B", active=True)
+
+    def test_attendance_view_does_not_lock_before_authorization_check(self):
+        """A student (wrong role entirely) must be rejected without ever taking a row lock."""
+        sess = Session.objects.create(batch=self.batch, starts_at=timezone.now(), ends_at=timezone.now() + timedelta(hours=1))
+        student_user = User.objects.create_user("stu@x.com", "stu@x.com", "Stud-pass-12345")
+        Profile.objects.create(user=student_user, role="student")
+        c = self.client_class(raise_request_exception=False)
+        c.force_login(student_user)
+        s = c.session
+        s["otp_verified"] = True
+        s.save()
+        self.assertEqual(c.get(f"/sessions/{sess.pk}/attendance/").status_code, 403)
+        # The view must not hold a lock afterwards - a normal admin request on the
+        # same row, from a fresh connection/transaction, must succeed immediately.
+        admin_c = self.client_class(raise_request_exception=False)
+        admin_c.force_login(self.admin)
+        s2 = admin_c.session
+        s2["otp_verified"] = True
+        s2.save()
+        self.assertEqual(admin_c.get(f"/sessions/{sess.pk}/attendance/").status_code, 200)
+
+    def test_forgot_password_takes_similar_time_for_unknown_email(self):
+        User.objects.create_user("known@x.com", "known@x.com", "Known-pass-1234")
+        Profile.objects.create(user=User.objects.get(email="known@x.com"), role="teacher")
+        c = self.client_class()
+        t0 = time.time()
+        c.post("/forgot-password/", {"email": "known@x.com"})
+        known_time = time.time() - t0
+        t0 = time.time()
+        c.post("/forgot-password/", {"email": "totally-unknown@x.com"})
+        unknown_time = time.time() - t0
+        self.assertGreater(unknown_time, 0.1)  # the deliberate equalising delay ran
+
+    def test_forgot_password_failed_smtp_does_not_reveal_account_exists(self):
+        User.objects.create_user("smtp@x.com", "smtp@x.com", "Smtp-pass-12345")
+        Profile.objects.create(user=User.objects.get(email="smtp@x.com"), role="teacher")
+        with patch("core.accounts.send_mail", side_effect=OSError("smtp down")):
+            r1 = self.client.post("/forgot-password/", {"email": "smtp@x.com"})
+        r2 = self.client.post("/forgot-password/", {"email": "nobody-at-all@x.com"})
+        self.assertContains(r1, "If an active account uses that address")
+        self.assertContains(r2, "If an active account uses that address")
+        self.assertNotContains(r1, "delivery failed")
+        self.assertNotContains(r1, "administrator")
+
+    def test_bulk_import_concurrent_collision_is_a_clean_message_not_a_500(self):
+        from .services import bulk_import_students
+        with patch("core.services.Student.objects.bulk_create", side_effect=IntegrityError("unique violation")):
+            created, errors = bulk_import_students([{"name": "X", "roll_number": "RX", "batch": "B"}])
+        self.assertEqual(created, 0)
+        self.assertEqual(errors[0][0], 0)
+        self.assertIn("same time", errors[0][1])
+        self.assertFalse(Student.objects.filter(roll_number="RX").exists())
+
+    def test_import_view_surfaces_whole_file_error_without_500(self):
+        with patch("core.services.Student.objects.bulk_create", side_effect=IntegrityError("x")):
+            c = self.client_class(raise_request_exception=False)
+            c.force_login(self.admin)
+            s = c.session
+            s["otp_verified"] = True
+            s.save()
+            upload = SimpleUploadedFile("s.csv", b"name,roll_number,batch\nX,RX,B\n", content_type="text/csv")
+            r = c.post("/students/import/", {"csv_file": upload})
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, "same time")
+
+    def test_session_cookie_samesite_is_pinned(self):
+        from django.conf import settings as dj_settings
+        self.assertEqual(dj_settings.SESSION_COOKIE_SAMESITE, "Lax")
+        self.assertEqual(dj_settings.CSRF_COOKIE_SAMESITE, "Lax")
+
+    def test_field_encryption_key_warning_fires_when_unset_in_production(self):
+        from django.core.checks import run_checks
+        with override_settings(DEBUG=False):
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("FIELD_ENCRYPTION_KEY", None)
+                warnings = [w for w in run_checks() if w.id == "core.W001"]
+        self.assertEqual(len(warnings), 1)
